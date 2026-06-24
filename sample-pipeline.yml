@@ -25,6 +25,15 @@ steps:
 - script: echo "Starting build for $(buildConfiguration)..."
   displayName: "Initialize Build"
 
+- script: echo "This step is disabled"
+  displayName: "Disabled step example"
+  enabled: false
+
+- pwsh: |
+    Write-Error "Something went wrong"
+  displayName: "Failing step (continues)"
+  continueOnError: true
+
 - task: DotNetCoreCLI@2
   displayName: "Restore NuGet packages"
   inputs:
@@ -40,6 +49,7 @@ steps:
 
 - script: echo "Running tests..."
   displayName: "Run unit tests"
+  continueOnError: true
 
 - task: DotNetCoreCLI@2
   displayName: "Publish artifacts"

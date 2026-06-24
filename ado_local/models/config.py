@@ -1,6 +1,7 @@
 from __future__ import annotations
+from pathlib import Path
 from typing import Any, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class ServiceConnectionMapping(BaseModel):
@@ -15,6 +16,16 @@ class LocalSettings(BaseModel):
     service_connections: dict[str, ServiceConnectionMapping] = Field(default_factory=dict)
     artifact_root: str = "Artifacts"
     workspace_root: str = ".ado-local"
-    task_cache_dir: str = "_tasks"
+    task_cache_dir: str = "~/.ado-local/tasks"
     tool_cache_dir: str = "_tool"
     settings_file: str = ".ado-local.json"
+    checkout_mode: str = "local"  # "clone" (remote) or "local" (offline copy from CWD)
+    azure_devops_org: Optional[str] = None
+    azure_devops_project: Optional[str] = None
+    azure_devops_token: Optional[str] = None
+
+    @model_validator(mode="after")
+    def expand_user_paths(self) -> LocalSettings:
+        self.task_cache_dir = str(Path(self.task_cache_dir).expanduser())
+        self.tool_cache_dir = str(Path(self.tool_cache_dir).expanduser())
+        return self

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 
 from ado_local import __version__
 from ado_local.models.config import LocalSettings
@@ -128,7 +129,9 @@ def prepare(
         success = True
         for spec in task_specs:
             with console.status(f"Downloading {spec}..."):
-                result = download_task(spec, cache_dir)
+                result = download_task(spec, cache_dir,
+                                       azure_devops_token=settings.azure_devops_token,
+                                       azure_devops_org=settings.azure_devops_org)
             if result:
                 console.print(f"  [green]v[/] {spec}")
             else:
@@ -228,21 +231,44 @@ def _run_headless(
                     task=step_data["task"],
                     display_name=step_data.get("displayName", step_data["task"]),
                     inputs=step_data.get("inputs", {}),
+                    condition=step_data.get("condition"),
+                    continue_on_error=step_data.get("continueOnError", False),
+                    enabled=step_data.get("enabled", True),
                 )
             elif "script" in step_data:
                 step = ScriptStep(
                     script=step_data["script"],
                     display_name=step_data.get("displayName", "script"),
+                    condition=step_data.get("condition"),
+                    continue_on_error=step_data.get("continueOnError", False),
+                    enabled=step_data.get("enabled", True),
+                    working_directory=step_data.get("workingDirectory"),
                 )
-            elif "powershell" in step_data:
+            elif "powershell" in step_data or "pwsh" in step_data:
+                script_content = step_data.get("powershell") or step_data.get("pwsh", "")
                 step = ScriptStep(
-                    script=step_data["powershell"],
+                    script=script_content,
                     display_name=step_data.get("displayName", "powershell"),
+                    condition=step_data.get("condition"),
+                    continue_on_error=step_data.get("continueOnError", False),
+                    enabled=step_data.get("enabled", True),
+                    working_directory=step_data.get("workingDirectory"),
                 )
             elif "checkout" in step_data:
-                step = CheckoutStep(checkout=step_data.get("checkout", "self"))
+                step = CheckoutStep(
+                    checkout=step_data.get("checkout", "self"),
+                    display_name=step_data.get("displayName", f"checkout: {step_data.get('checkout', 'self')}"),
+                    submodules=step_data.get("submodules", False),
+                    persist_credentials=step_data.get("persistCredentials", False),
+                    lfs=step_data.get("lfs", False),
+                    path=step_data.get("path"),
+                    condition=step_data.get("condition"),
+                    continue_on_error=step_data.get("continueOnError", False),
+                    enabled=step_data.get("enabled", True),
+                )
             else:
                 continue
+
             job.steps.append(step)
 
         pipe.jobs = [job]
@@ -261,7 +287,7 @@ def _run_headless(
                 dur = f" ({step.duration:.1f}s)" if step.duration else ""
                 console.print(f"  [{color}]{icon}[/] {name}{dur}")
                 for line in step.logs:
-                    console.print(f"    [dim]{line}[/]")
+                    console.print(f"    [dim]{escape(line)}[/]")
                 if step.status.value != "succeeded":
                     all_ok = False
 

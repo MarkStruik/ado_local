@@ -13,7 +13,7 @@ VSO_COMMAND_RE = re.compile(
     r"\](?P<value>.*)",
     re.IGNORECASE,
 )
-PROP_RE = re.compile(r"(\w+)=([\"\']?)([^\s\"\']+)\2")
+PROP_RE = re.compile(r"(\w+)=([\"\']?)([^\s\"\';]+)\2")
 
 
 @dataclass
@@ -45,6 +45,14 @@ class LoggingCommandProcessor:
         self.task_result: Optional[str] = None
         self.attachments: list[dict[str, str]] = []
         self.summaries: list[str] = []
+        self.secrets: list[str] = []
+
+    def mask(self, line: str) -> str:
+        masked = line
+        for secret in self.secrets:
+            if secret:
+                masked = masked.replace(secret, "***")
+        return masked
 
     def process_line(self, line: str) -> Optional[VsoCommand]:
         cmd = parse_vso_command(line)
@@ -67,9 +75,15 @@ class LoggingCommandProcessor:
         var_name = cmd.properties.get("variable")
         if var_name:
             self.variables[var_name] = cmd.value
+        if cmd.properties.get("issecret", "").lower() == "true" and cmd.value:
+            self.secrets.append(cmd.value)
+
+    def _cmd_task_setsecret(self, cmd: VsoCommand) -> None:
+        if cmd.value:
+            self.secrets.append(cmd.value)
 
     def _cmd_task_complete(self, cmd: VsoCommand) -> None:
-        self.task_result = cmd.properties.get("result", "succeeded")
+        self.task_result = cmd.properties.get("result", "succeeded").lower()
 
     def _cmd_task_logissue(self, cmd: VsoCommand) -> None:
         issue_type = cmd.properties.get("type", "warning")

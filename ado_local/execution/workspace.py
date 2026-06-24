@@ -12,7 +12,7 @@ class WorkspaceManager:
     def __init__(self, settings: LocalSettings, run_id: str | None = None) -> None:
         self.settings = settings
         self.run_id = run_id or uuid.uuid4().hex[:12]
-        self.root = Path(settings.workspace_root) / "work" / f"run-{self.run_id}"
+        self.root = Path(settings.workspace_root).resolve() / "work" / f"run-{self.run_id}"
 
     def create(self) -> Path:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -58,14 +58,14 @@ class WorkspaceManager:
 
     def get_env(self) -> dict[str, str]:
         return {
-            "AGENT_TEMPDIRECTORY": str(self.temp_dir),
-            "AGENT_TOOLSDIRECTORY": str(self.tool_dir),
-            "AGENT_WORKFOLDER": str(self.root.parent),
-            "AGENT_BUILDDIRECTORY": str(self.root),
-            "BUILD_SOURCESDIRECTORY": str(self.sources_dir),
-            "BUILD_STAGINGDIRECTORY": str(self.staging_dir),
-            "BUILD_BINARIESDIRECTORY": str(self.binaries_dir),
-            "BUILD_ARTIFACTSTAGINGDIRECTORY": str(self.staging_dir),
-            "SYSTEM_DEFAULTWORKINGDIRECTORY": str(self.root),
-            "SYSTEM_ARTIFACTSDIRECTORY": str(self.staging_dir),
+            "AGENT_TEMPDIRECTORY": str(self.temp_dir.resolve()),
+            "AGENT_TOOLSDIRECTORY": str(self.tool_dir.resolve()),
+            "AGENT_WORKFOLDER": str(self.root.parent.resolve()),
+            "AGENT_BUILDDIRECTORY": str(self.root.resolve()),
+            "BUILD_SOURCESDIRECTORY": str(self.sources_dir.resolve()),
+            "BUILD_STAGINGDIRECTORY": str(self.staging_dir.resolve()),
+            "BUILD_BINARIESDIRECTORY": str(self.binaries_dir.resolve()),
+            "BUILD_ARTIFACTSTAGINGDIRECTORY": str(self.staging_dir.resolve()),
+            "SYSTEM_DEFAULTWORKINGDIRECTORY": str(self.root.resolve()),
+            "SYSTEM_ARTIFACTSDIRECTORY": str(self.staging_dir.resolve()),
         }

@@ -18,6 +18,7 @@ class TaskStep(BaseModel):
     display_name: Optional[str] = None
     inputs: dict[str, Any] = Field(default_factory=dict)
     condition: Optional[str] = None
+    continue_on_error: bool = False
     enabled: bool = True
     timeout_in_minutes: Optional[int] = None
     env: dict[str, Any] = Field(default_factory=dict)
@@ -36,10 +37,14 @@ class TaskStep(BaseModel):
 
 class CheckoutStep(BaseModel):
     checkout: str = "self"
+    display_name: Optional[str] = None
     submodules: bool = False
     persist_credentials: bool = False
     lfs: bool = False
     path: Optional[str] = None
+    condition: Optional[str] = None
+    continue_on_error: bool = False
+    enabled: bool = True
     status: StepStatus = StepStatus.PENDING
     logs: list[str] = Field(default_factory=list)
     start_time: Optional[float] = None
@@ -56,8 +61,10 @@ class ScriptStep(BaseModel):
     script: str
     display_name: Optional[str] = None
     condition: Optional[str] = None
+    continue_on_error: bool = False
     enabled: bool = True
     env: dict[str, Any] = Field(default_factory=dict)
+    working_directory: Optional[str] = None
     status: StepStatus = StepStatus.PENDING
     logs: list[str] = Field(default_factory=list)
     start_time: Optional[float] = None
@@ -71,7 +78,27 @@ class ScriptStep(BaseModel):
         return None
 
 
-Step = TaskStep | CheckoutStep | ScriptStep
+class PublishStep(BaseModel):
+    publish: str  # source path
+    artifact: str  # artifact name
+    display_name: Optional[str] = None
+    condition: Optional[str] = None
+    continue_on_error: bool = False
+    enabled: bool = True
+    status: StepStatus = StepStatus.PENDING
+    logs: list[str] = Field(default_factory=list)
+    start_time: Optional[float] = None
+    end_time: Optional[float] = None
+    artifact_path: Optional[str] = None
+
+    @property
+    def duration(self) -> Optional[float]:
+        if self.start_time and self.end_time:
+            return self.end_time - self.start_time
+        return None
+
+
+Step = TaskStep | CheckoutStep | ScriptStep | PublishStep
 
 
 class JobStatus(str, Enum):
@@ -120,3 +147,12 @@ class Pipeline(BaseModel):
     steps: list[Step] = Field(default_factory=list)
     workspace_dir: Optional[str] = None
     run_id: Optional[str] = None
+
+
+class RunRecord(BaseModel):
+    pipeline_name: str
+    pipeline_path: str
+    timestamp: float
+    duration: float
+    pipeline_json: str  # serialized Pipeline
+    preflight_logs: list[str] = Field(default_factory=list)

@@ -3,18 +3,30 @@ from __future__ import annotations
 import re
 from typing import Any
 
-COUNTER_RE = re.compile(r"\$\[counter\((?:\w+\.)?(\w+),\s*(\d+)\)\]")
+COUNTER_RE = re.compile(r"\$\[counter\((?P<prefix>.+?),\s*(?P<seed>\d+)\)\]")
 RUNTIME_EXPR_RE = re.compile(r"\$\[([^\]]+)\]")
 TEMPLATE_EXPR_RE = re.compile(r"\$\{\{([^}]+)\}\}")
 
 
 def eval_runtime_expression(expr: str, context: dict[str, Any], counters: dict[str, int] | None = None) -> str:
-    if not counters:
+    if counters is None:
         counters = {}
 
+    def eval_counter_prefix(value: str) -> str:
+        value = value.strip()
+        m = re.fullmatch(r"variables\[['\"]([^'\"]+)['\"]\]", value)
+        if m:
+            return str(context.get("variables", {}).get(m.group(1), m.group(1)))
+        if value.startswith("variables."):
+            name = value[len("variables."):]
+            return str(context.get("variables", {}).get(name, name))
+        if (value.startswith("'") and value.endswith("'")) or (value.startswith('"') and value.endswith('"')):
+            return value[1:-1]
+        return value
+
     def replace_counter(m: re.Match) -> str:
-        name = m.group(1)
-        seed = int(m.group(2))
+        name = eval_counter_prefix(m.group("prefix"))
+        seed = int(m.group("seed"))
         key = f"counter:{name}"
         current = counters.get(key, seed - 1)
         next_val = current + 1
