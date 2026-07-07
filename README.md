@@ -1,5 +1,8 @@
 # ADO Local
 
+<img width="1239" height="698" alt="image" src="https://github.com/user-attachments/assets/f61fc0ad-5618-4ae5-b427-10acc6df540a" />
+
+
 ADO Local is a local Azure DevOps YAML pipeline runner. It is designed to shorten the pipeline feedback loop by running Azure DevOps-style pipeline YAML on your machine, while emulating the parts of the Azure Pipelines agent that tasks expect.
 
 The project is a Python CLI package named `ado-local`. It parses pipeline YAML, prepares local workspaces, runs script and task steps, processes Azure DevOps logging commands, and stores artifacts locally instead of uploading them to Azure DevOps.
