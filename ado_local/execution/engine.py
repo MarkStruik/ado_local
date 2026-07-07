@@ -25,6 +25,7 @@ from ado_local.execution.task_runner import _should_suppress_logging_command
 from ado_local.cache.task_cache import resolve_task
 from ado_local.parser.variable_expander import expand_variables
 from ado_local.parser.expression import eval_runtime_expression
+from ado_local.parser.pipeline import evaluate_condition
 from ado_local.logging.command_parser import LoggingCommandProcessor
 from ado_local.logging.ansi import normalize_log_line
 
@@ -82,29 +83,56 @@ class PipelineEngine:
                 context["variables"] = self.variables
 
     def _execute_stages(self, pipeline: Pipeline, start_from_step: int = 0) -> None:
+        failed = False
         for stage in pipeline.stages:
+            stage_vars = {**pipeline.variables, **stage.variables, **self.variables}
+            if not evaluate_condition(stage.condition, stage_vars, succeeded=not failed, failed=failed, canceled=self.cancel_requested()):
+                stage.status = JobStatus.CANCELLED if self.cancel_requested() else JobStatus.CANCELLED
+                self._mark_stage_steps_skipped(stage)
+                self._emit(EventType.STAGE_START, step_name=stage.name)
+                self._emit(EventType.STAGE_COMPLETE, step_name=stage.name, status="skipped")
+                continue
             self._emit(EventType.STAGE_START, step_name=stage.name)
             stage.status = JobStatus.RUNNING
+            stage_failed = False
             for job in stage.jobs:
-                self._execute_job(job, stage.variables, start_from_step=start_from_step)
-            stage.status = JobStatus.SUCCEEDED
+                self._execute_job(job, stage_vars, start_from_step=start_from_step, prior_failed=stage_failed)
+                if job.status == JobStatus.FAILED:
+                    stage_failed = True
+            stage.status = JobStatus.FAILED if stage_failed else JobStatus.SUCCEEDED
+            if stage_failed:
+                failed = True
             self._emit(EventType.STAGE_COMPLETE, step_name=stage.name)
 
     def _execute_jobs(self, pipeline: Pipeline, start_from_step: int = 0) -> None:
+        failed = False
         for job in pipeline.jobs:
+            if not evaluate_condition(job.condition, {**pipeline.variables, **job.variables, **self.variables}, succeeded=not failed, failed=failed, canceled=self.cancel_requested()):
+                job.status = JobStatus.CANCELLED if self.cancel_requested() else JobStatus.CANCELLED
+                self._mark_job_steps_skipped(job)
+                self._emit(EventType.JOB_START, step_name=job.name)
+                self._emit(EventType.JOB_COMPLETE, step_name=job.name, status="skipped")
+                continue
             self._emit(EventType.JOB_START, step_name=job.name)
             job.status = JobStatus.RUNNING
-            self._execute_job(job, pipeline.variables, start_from_step=start_from_step)
-            job.status = JobStatus.SUCCEEDED
+            self._execute_job(job, pipeline.variables, start_from_step=start_from_step, prior_failed=failed)
+            if job.status == JobStatus.FAILED:
+                failed = True
             self._emit(EventType.JOB_COMPLETE, step_name=job.name)
 
-    def _execute_job(self, job: Job, inherited_vars: dict[str, Any], start_from_step: int = 0) -> None:
+    def _execute_job(self, job: Job, inherited_vars: dict[str, Any], start_from_step: int = 0, prior_failed: bool = False) -> None:
         job.start_time = time.time()
         merged_vars = {**inherited_vars, **job.variables, **self.variables}
-        self._execute_steps_in_job(job, merged_vars, start_from_step=start_from_step)
+        if not evaluate_condition(job.condition, merged_vars, succeeded=not prior_failed, failed=prior_failed, canceled=self.cancel_requested()):
+            job.status = JobStatus.CANCELLED if self.cancel_requested() else JobStatus.CANCELLED
+            self._mark_job_steps_skipped(job)
+            job.end_time = time.time()
+            return
+        failed = self._execute_steps_in_job(job, merged_vars, start_from_step=start_from_step)
+        job.status = JobStatus.FAILED if failed else JobStatus.SUCCEEDED
         job.end_time = time.time()
 
-    def _execute_steps_in_job(self, job: Job, variables: dict[str, Any], start_from_step: int = 0) -> None:
+    def _execute_steps_in_job(self, job: Job, variables: dict[str, Any], start_from_step: int = 0) -> bool:
         failed = False
         for step_idx, step in enumerate(job.steps):
             if step_idx < start_from_step:
@@ -120,12 +148,13 @@ class PipelineEngine:
                 continue
 
             if self.cancel_requested() or failed:
-                step.status = StepStatus.SKIPPED
-                reason = "cancelled" if self.cancel_requested() else "previous step failed"
-                self._emit(EventType.STEP_START, step_index=step_idx, step_name=str(step))
-                self._emit(EventType.STEP_LOG, step_index=step_idx, step_name=str(step), log_line=f"Step skipped ({reason})")
-                self._emit(EventType.STEP_COMPLETE, step_index=step_idx, step_name=str(step), status="skipped")
-                continue
+                if not evaluate_condition(step.condition, variables, succeeded=not failed, failed=failed, canceled=self.cancel_requested()):
+                    step.status = StepStatus.SKIPPED
+                    reason = "cancelled" if self.cancel_requested() else "previous step failed"
+                    self._emit(EventType.STEP_START, step_index=step_idx, step_name=str(step))
+                    self._emit(EventType.STEP_LOG, step_index=step_idx, step_name=str(step), log_line=f"Step skipped ({reason})")
+                    self._emit(EventType.STEP_COMPLETE, step_index=step_idx, step_name=str(step), status="skipped")
+                    continue
 
             self._emit(EventType.STEP_START, step_index=step_idx, step_name=str(step))
             step_vars = dict(variables)
@@ -139,6 +168,12 @@ class PipelineEngine:
             step_vars["Agent.ToolsDirectory"] = str(self.workspace.tool_dir.resolve())
             step_vars["System.DefaultWorkingDirectory"] = str(self.workspace.root.resolve())
             step_vars["System.ArtifactsDirectory"] = str(self.workspace.staging_dir.resolve())
+
+            if not evaluate_condition(step.condition, step_vars, succeeded=not failed, failed=failed, canceled=self.cancel_requested()):
+                step.status = StepStatus.SKIPPED
+                self._emit(EventType.STEP_LOG, step_index=step_idx, step_name=str(step), log_line="Step skipped (condition evaluated to false)")
+                self._emit(EventType.STEP_COMPLETE, step_index=step_idx, step_name=str(step), status="skipped")
+                continue
 
             if isinstance(step, CheckoutStep):
                 branch = detect_current_branch()
@@ -185,10 +220,21 @@ class PipelineEngine:
                     failed = True
 
             self._emit(EventType.STEP_COMPLETE, step_index=step_idx, step_name=str(step), status=step.status.value)
+        return failed
 
     def _execute_steps(self, pipeline: Pipeline, variables: dict[str, Any]) -> None:
         pipeline.jobs.append(Job(name="default", steps=pipeline.steps))
         self._execute_steps_in_job(pipeline.jobs[0], variables)
+
+    def _mark_stage_steps_skipped(self, stage: Stage) -> None:
+        for job in stage.jobs:
+            job.status = JobStatus.CANCELLED
+            self._mark_job_steps_skipped(job)
+
+    def _mark_job_steps_skipped(self, job: Job) -> None:
+        for step in job.steps:
+            if step.status == StepStatus.PENDING:
+                step.status = StepStatus.SKIPPED
 
     def _resolve_task(self, step: TaskStep, variables: dict[str, Any]) -> Any:
         cache_dir = Path(self.settings.task_cache_dir)

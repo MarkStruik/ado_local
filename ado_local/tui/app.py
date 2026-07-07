@@ -70,9 +70,12 @@ from ado_local.models.pipeline import (
 from ado_local.execution.engine import PipelineEngine
 from ado_local.execution.checkout import detect_current_branch
 from ado_local.parser.yaml_loader import load_pipeline_yaml
-from ado_local.parser.variable_expander import expand_variables
-from ado_local.parser.expression import expand_template_expressions, eval_runtime_expression
-from ado_local.parser.template import process_conditionals
+from ado_local.parser.expression import eval_runtime_expression
+from ado_local.parser.pipeline import (
+    collect_pipeline_tasks,
+    load_and_compile_pipeline,
+    parse_pipeline_model,
+)
 
 
 PIPELINE_PATTERNS = [
@@ -414,7 +417,7 @@ class RunHistoryScreen(Screen):
         self._start_new_run()
 
     def _start_new_run(self) -> None:
-        if self._pipeline_info.get("parameters"):
+        if self._pipeline_info.get("parameters") or self._pipeline_info.get("variables"):
             self.app.push_screen(ParameterScreen(self._pipeline_info))
         else:
             self.app.push_screen(RunScreen(self._pipeline_info))
@@ -475,7 +478,7 @@ def parse_pipeline_info(path: Path) -> dict[str, Any]:
     try:
         data = load_pipeline_yaml(path)
     except Exception as e:
-        return {"name": path.name, "path": str(path), "parameters": [], "error": str(e)}
+        return {"name": path.name, "path": str(path), "parameters": [], "variables": [], "error": str(e)}
     trigger = data.get("trigger", {})
     trigger_name = ""
     if isinstance(trigger, dict):
@@ -514,12 +517,69 @@ def parse_pipeline_info(path: Path) -> dict[str, Any]:
                     "required": False,
                     "values": [],
                 })
+    variables = _parse_pipeline_variables(data.get("variables", {}))
     return {
         "name": name,
         "path": str(path),
         "parameters": params,
+        "variables": variables,
         "error": None,
     }
+
+
+def _parse_pipeline_variables(raw: Any) -> list[dict[str, Any]]:
+    variables: list[dict[str, Any]] = []
+    if isinstance(raw, dict):
+        for key, val in raw.items():
+            variables.append({"name": str(key), "value": val, "readonly": False})
+    elif isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            if "name" in item:
+                variables.append({
+                    "name": str(item.get("name", "")),
+                    "value": item.get("value", ""),
+                    "readonly": bool(item.get("readonly", False)),
+                })
+    return variables
+
+
+def _pipeline_jobs_with_stage(pipeline: Pipeline) -> list[tuple[str | None, Job]]:
+    if pipeline.stages:
+        return [
+            (stage.display_name or stage.name, job)
+            for stage in pipeline.stages
+            for job in stage.jobs
+        ]
+    return [(None, job) for job in pipeline.jobs]
+
+
+def _pipeline_steps_flat(pipeline: Pipeline) -> list[Step]:
+    return [step for _, job in _pipeline_jobs_with_stage(pipeline) for step in job.steps]
+
+
+def _replace_pipeline_step(pipeline: Pipeline, old: Step, new: Step) -> None:
+    for _, job in _pipeline_jobs_with_stage(pipeline):
+        for idx, step in enumerate(job.steps):
+            if step is old:
+                job.steps[idx] = new
+                return
+
+
+def _step_display_name(step: Step, fallback: str = "step") -> str:
+    display = getattr(step, "display_name", None)
+    if display:
+        return str(display)
+    if isinstance(step, TaskStep):
+        return step.task
+    if isinstance(step, CheckoutStep):
+        return f"checkout: {step.checkout}"
+    if isinstance(step, ScriptStep):
+        return "script"
+    if isinstance(step, PublishStep):
+        return f"publish: {step.publish}"
+    return fallback
 
 
 class PipelineSelectScreen(Screen):
@@ -579,6 +639,8 @@ class PipelineSelectScreen(Screen):
             label = f"[bold]{info['name']}[/]"
             if info.get("parameters"):
                 label += f"  [{len(info['parameters'])} params]"
+            if info.get("variables"):
+                label += f"  [{len(info['variables'])} vars]"
             label += f"\n  [dim]{info['path']}[/]"
             list_view.append(ListItem(Static(label)))
 
@@ -596,6 +658,12 @@ class PipelineSelectScreen(Screen):
                     default = f" (default: {p['default']})" if p["default"] is not None else ""
                     values = f" [{', '.join(p['values'])}]" if p.get("values") else ""
                     info_text += f"\n  {req}[bold]{p['name']}[/]{values}{default}"
+            if info.get("variables"):
+                info_text += "\n\n[bold]Variables:[/]"
+                for v in info["variables"]:
+                    value = f" = {v.get('value')}" if v.get("value") is not None else ""
+                    readonly = " [dim](readonly)[/]" if v.get("readonly") else ""
+                    info_text += f"\n  [bold]{v['name']}[/]{value}{readonly}"
             if info.get("error"):
                 info_text += f"\n\n[red]Error: {info['error']}[/]"
             self.query_one("#pipeline-info", Static).update(info_text)
@@ -667,10 +735,10 @@ class ParameterScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield Container(
-            Static(f"[bold]Parameters for:[/] {self._pipeline_info['name']}", id="param-title"),
+            Static(f"[bold]Run inputs for:[/] {self._pipeline_info['name']}", id="param-title"),
             VerticalScroll(id="param-fields"),
             Horizontal(
-                Static(" Run ", id="run-params", classes="raw-log-action success-action"),
+                Static(" Preview ", id="run-params", classes="raw-log-action success-action"),
                 Static(" Back ", id="back", classes="raw-log-action"),
                 id="param-buttons",
             ),
@@ -680,7 +748,9 @@ class ParameterScreen(Screen):
 
     def on_mount(self) -> None:
         fields = self.query_one("#param-fields", VerticalScroll)
-        for p in self._pipeline_info["parameters"]:
+        if self._pipeline_info.get("parameters"):
+            fields.mount(Static("[bold cyan]Parameters[/]"))
+        for idx, p in enumerate(self._pipeline_info.get("parameters", [])):
             req = "[red]*[/] " if p["required"] else ""
             label = f"{req}[bold]{p['name']}[/] ({p['type']})"
             if p.get("values"):
@@ -689,10 +759,17 @@ class ParameterScreen(Screen):
             default = p.get("default") or ""
             inp = Input(
                 placeholder=str(default),
-                id=f"param-{p['name']}",
+                id=f"param-{idx}",
                 value=str(default) if default else "",
             )
             fields.mount(inp)
+        if self._pipeline_info.get("variables"):
+            fields.mount(Static("[bold cyan]Variables[/]"))
+        for idx, v in enumerate(self._pipeline_info.get("variables", [])):
+            readonly = " [dim](readonly)[/]" if v.get("readonly") else ""
+            fields.mount(Static(f"[bold]{v['name']}[/]{readonly}"))
+            value = "" if v.get("value") is None else str(v.get("value"))
+            fields.mount(Input(placeholder=value, id=f"var-{idx}", value=value))
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "run-params":
@@ -709,12 +786,18 @@ class ParameterScreen(Screen):
 
     def _do_run(self) -> None:
         params = {}
-        for p in self._pipeline_info["parameters"]:
-            inp = self.query_one(f"#param-{p['name']}", Input)
+        for idx, p in enumerate(self._pipeline_info.get("parameters", [])):
+            inp = self.query_one(f"#param-{idx}", Input)
             val = inp.value if inp.value else p.get("default")
             if val is not None:
                 params[p["name"]] = val
-        info = {**self._pipeline_info, "resolved_params": params}
+        variables = {}
+        for idx, v in enumerate(self._pipeline_info.get("variables", [])):
+            inp = self.query_one(f"#var-{idx}", Input)
+            val = inp.value if inp.value else v.get("value")
+            if val is not None:
+                variables[v["name"]] = val
+        info = {**self._pipeline_info, "resolved_params": params, "resolved_variables": variables}
         self.app.push_screen(RunScreen(info))
 
     def action_run(self) -> None:
@@ -801,7 +884,7 @@ class AnalyzeScreen(Screen):
 
         path = Path(self._pipeline_info["path"])
         try:
-            data = load_pipeline_yaml(path)
+            data = load_and_compile_pipeline(path)
             log.write(f"[green]v[/] Parsed pipeline: {path}")
         except Exception as e:
             log.write(f"[red]x[/] Failed to parse: {e}")
@@ -934,7 +1017,7 @@ class RunResultScreen(ModalScreen):
 
         status_icon = self.ICON_SUCCEEDED
         status_color = "green"
-        for job in self._pipeline.jobs:
+        for _, job in _pipeline_jobs_with_stage(self._pipeline):
             for step in job.steps:
                 if step.status == StepStatus.FAILED:
                     status_icon = self.ICON_FAILED
@@ -943,25 +1026,31 @@ class RunResultScreen(ModalScreen):
                     all_succeeded = False
                 elif step.status == StepStatus.SUCCEEDED:
                     succeeded += 1
-                elif step.status != StepStatus.SUCCEEDED:
+                elif step.status not in (StepStatus.SUCCEEDED, StepStatus.SKIPPED):
                     all_succeeded = False
 
-        job_node = tree.root.add(Text.assemble((status_icon, status_color), " ", ("Job", ""), (f" ({_format_duration(self._duration)})", "dim")))
+        root_node = tree.root.add(Text.assemble((status_icon, status_color), " ", ("Pipeline", ""), (f" ({_format_duration(self._duration)})", "dim")))
 
-        preflight_node = job_node.add_leaf(f"[green]{self.ICON_SUCCEEDED}[/] Initialize job")
+        preflight_node = root_node.add_leaf(f"[green]{self.ICON_SUCCEEDED}[/] Initialize job")
         preflight_node.data = self._preflight_logs
         self._node_status[id(preflight_node)] = "completed"
 
-        for job in self._pipeline.jobs:
-            for step_idx, step in enumerate(job.steps):
+        step_idx = 0
+        for stage_name, job in _pipeline_jobs_with_stage(self._pipeline):
+            parent = root_node
+            if stage_name:
+                parent = root_node.add(f"Stage: {stage_name}")
+            job_node = parent.add(f"Job: {job.display_name or job.name}")
+            for step in job.steps:
                 icon = self.ICON_SUCCEEDED if step.status == StepStatus.SUCCEEDED else self.ICON_FAILED if step.status == StepStatus.FAILED else self.ICON_SKIPPED
                 dur = _format_duration(step.duration) if step.duration else ""
                 color = "green" if step.status == StepStatus.SUCCEEDED else "red" if step.status == StepStatus.FAILED else "dim"
-                label = getattr(step, "display_name", None) or getattr(step, "task", type(step).__name__)
+                label = _step_display_name(step, type(step).__name__)
                 row = self._format_step_row(str(label), dur)
                 node = job_node.add_leaf(f"[{color}]{icon}[/] {row}")
                 node.data = (step_idx, step.logs[:])
                 self._node_status[id(node)] = step.status.value if isinstance(step.status, StepStatus) else str(step.status)
+                step_idx += 1
 
         tree.root.expand_all()
         self._update_result_header(all_succeeded, succeeded, failed)
@@ -1221,6 +1310,7 @@ class RunScreen(Screen):
     DEFAULT_LOG_TAIL_LINES = 100
     LOG_PAGE_LINES = 500
     BINDINGS = [
+        Binding("s", "start", "Start"),
         Binding("c", "cancel", "Cancel"),
         Binding("escape", "cancel", "Cancel"),
         Binding("y", "copy_logs", "Copy Logs"),
@@ -1256,6 +1346,8 @@ class RunScreen(Screen):
         self._resume_step_index: int | None = resume_step_index
         self._resume_workspace_path: str | None = resume_workspace_path
         self._resume_pipeline: Pipeline | None = resume_pipeline
+        self._started: bool = False
+        self._can_start: bool = True
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -1282,6 +1374,7 @@ class RunScreen(Screen):
             ),
             Horizontal(
                 Static("", id="run-footer"),
+                Static(" Start ", id="start", classes="raw-log-action success-action"),
                 Static(" Cancel ", id="cancel", classes="raw-log-action danger-action"),
                 id="run-footer-row",
             ),
@@ -1290,16 +1383,12 @@ class RunScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
-        self._start_time = time.time()
+        self._log_widget = self.query_one("#step-log", RichLog)
         self._build_step_tree()
         self.set_interval(0.15, self._tick_spinner)
-        self._log_widget = self.query_one("#step-log", RichLog)
-        if self._resume_step_index is not None:
-            self._update_run_header("resuming")
-        else:
-            self._update_run_header("preparing")
-        self._start_preflight()
-        self._run_pipeline()
+        self._all_log_lines.append("Review the compiled pipeline plan, then press Start to run.")
+        self._update_run_header("preview")
+        self._render_selected_log()
 
     def _write_log(self, msg: str) -> None:
         try:
@@ -1349,68 +1438,98 @@ class RunScreen(Screen):
         tree.clear()
         tree.show_root = False
         params = self._pipeline_info.get("resolved_params", {})
+        variable_overrides = self._pipeline_info.get("resolved_variables", {})
         self._root_node = tree.root
         self._step_nodes: list[TreeNode] = []
         self._step_data: list[Any] = []
         self._step_display_names: list[str] = []
         self._step_logs: dict[int, list[str]] = {}
+        self._extra_node_logs: dict[int, list[str]] = {}
+        self._extra_node_titles: dict[int, str] = {}
 
         path = Path(self._pipeline_info["path"])
         try:
-            data = load_pipeline_yaml(path)
-            data = expand_template_expressions(data, {"parameters": params})
-            data = process_conditionals(data, {"parameters": params})
-        except Exception:
+            data = load_and_compile_pipeline(path, params, variable_overrides)
+            preview_pipeline = parse_pipeline_model(data, path)
+        except Exception as e:
+            tree.root.add(f"[red]{self.ICON_FAILED} Failed to compile pipeline[/]")
+            self._all_log_lines.append(f"Compile failed: {e}")
+            if hasattr(self, "_log_widget"):
+                self._log_widget.write(Text.from_markup(f"[red]Compile failed: {e}[/]"))
+            self._can_start = False
+            self.query_one("#start", Static).add_class("disabled-action")
             return
 
-        branch = detect_current_branch()
+        input_preview = self._preview_inputs(preview_pipeline.variables, params)
+        self._all_log_lines.extend(input_preview)
+        input_node = tree.root.add_leaf(f"{self.ICON_PENDING} Parameters / Variables")
+        self._extra_node_logs[id(input_node)] = input_preview
+        self._extra_node_titles[id(input_node)] = "Parameters / Variables"
+        self._selected_log_index = f"node:{id(input_node)}"
 
-        steps_raw = data.get("steps", [])
-        job_node = tree.root.add(f"{self.ICON_PENDING} Job")
+        step_idx = 0
+        jobs = _pipeline_jobs_with_stage(preview_pipeline)
+        stage_nodes: dict[str, TreeNode] = {}
+        job_nodes: dict[int, TreeNode] = {}
+        default_job_node: TreeNode | None = None
 
-        preflight_node = job_node.add_leaf(Text.assemble((self.ICON_PENDING, "dim"), " ", (self._format_step_row("Initialize job"), "")))
+        def get_job_node(stage_name: str | None, job: Job) -> TreeNode:
+            nonlocal default_job_node
+            cached = job_nodes.get(id(job))
+            if cached is not None:
+                return cached
+            label = job.display_name or job.name
+            if stage_name:
+                stage_node = stage_nodes.get(stage_name)
+                if stage_node is None:
+                    stage_node = tree.root.add(f"{self.ICON_PENDING} Stage: {stage_name}")
+                    stage_nodes[stage_name] = stage_node
+                job_node = stage_node.add(f"{self.ICON_PENDING} Job: {label}")
+                job_nodes[id(job)] = job_node
+                return job_node
+            if default_job_node is None:
+                default_job_node = tree.root.add(f"{self.ICON_PENDING} Job: {label}")
+            job_nodes[id(job)] = default_job_node
+            return default_job_node
+
+        first_job_node = get_job_node(jobs[0][0], jobs[0][1]) if jobs else tree.root.add(f"{self.ICON_PENDING} Job")
+
+        preflight_node = first_job_node.add_leaf(Text.assemble((self.ICON_PENDING, "dim"), " ", (self._format_step_row("Initialize job"), "")))
         self._preflight_node = preflight_node
         self._preflight_logs = []
 
-        for i, step_data in enumerate(steps_raw):
-            if "checkout" in step_data:
-                label = branch or "self"
-                name = f"checkout: {label}"
-            else:
-                name = (
-                    step_data.get("task")
-                    or step_data.get("script")
-                    or step_data.get("powershell")
-                    or ("publish: " + str(step_data.get("publish", "")) if "publish" in step_data else None)
-                    or step_data.get("displayName")
-                    or f"step {i}"
-                )
-            if isinstance(name, dict):
-                name = str(list(name.keys())[0]) if name else f"step {i}"
-            display = step_data.get("displayName", name)
-            previous = self._previous_step(i) if self._resume_step_index is not None and i < self._resume_step_index else None
-            if previous is not None:
-                status = previous.status.value if isinstance(previous.status, StepStatus) else str(previous.status)
-                icon = self.ICON_SUCCEEDED if previous.status == StepStatus.SUCCEEDED else self.ICON_FAILED if previous.status == StepStatus.FAILED else self.ICON_SKIPPED
-                style = "green" if previous.status == StepStatus.SUCCEEDED else "red" if previous.status == StepStatus.FAILED else "dim"
-                duration = _format_duration(previous.duration) if previous.duration else ""
-            else:
-                status = "pending"
-                icon = self.ICON_PENDING
-                style = "dim"
-                duration = ""
-            node = job_node.add_leaf(Text.assemble((icon, style), " ", (self._format_step_row(str(display), duration), "")))
-            self._step_nodes.append(node)
-            self._step_data.append(step_data)
-            self._step_display_names.append(display)
-            self._step_status[i] = status
-            if previous is not None:
-                self._step_logs[i] = previous.logs[:]
-                if previous.duration is not None:
-                    self._step_durations[i] = previous.duration
+        for stage_name, job in jobs:
+            job_node = get_job_node(stage_name, job)
+            for step in job.steps:
+                display = _step_display_name(step, f"step {step_idx}")
+                previous = self._previous_step(step_idx) if self._resume_step_index is not None and step_idx < self._resume_step_index else None
+                if previous is not None:
+                    status = previous.status.value if isinstance(previous.status, StepStatus) else str(previous.status)
+                    icon = self.ICON_SUCCEEDED if previous.status == StepStatus.SUCCEEDED else self.ICON_FAILED if previous.status == StepStatus.FAILED else self.ICON_SKIPPED
+                    style = "green" if previous.status == StepStatus.SUCCEEDED else "red" if previous.status == StepStatus.FAILED else "dim"
+                    duration = _format_duration(previous.duration) if previous.duration else ""
+                else:
+                    status = "pending"
+                    icon = self.ICON_PENDING
+                    style = "dim"
+                    duration = ""
+                node = job_node.add_leaf(Text.assemble((icon, style), " ", (self._format_step_row(str(display), duration), "")))
+                self._step_nodes.append(node)
+                self._step_data.append(step)
+                self._step_display_names.append(display)
+                self._step_status[step_idx] = status
+                if previous is not None:
+                    self._step_logs[step_idx] = previous.logs[:]
+                    if previous.duration is not None:
+                        self._step_durations[step_idx] = previous.duration
+                step_idx += 1
 
         tree.root.expand()
-        job_node.expand_all()
+        for node in stage_nodes.values():
+            node.expand_all()
+        if default_job_node:
+            default_job_node.expand_all()
+        first_job_node.expand_all()
 
     def _handle_pipeline_event(self, event: PipelineEvent) -> None:
         self.app.call_from_thread(self._on_pipeline_event, event)
@@ -1427,10 +1546,29 @@ class RunScreen(Screen):
             self._log_widget.write(Text.from_markup(f"[red]Copy failed: {e}[/]"))
 
     def action_cancel(self) -> None:
+        if not self._started:
+            self.app.pop_screen()
+            return
         self._cancelled = True
         self.query_one("#cancel", Static).add_class("disabled-action")
         log = self.query_one("#step-log", RichLog)
         log.write(Text.from_markup("[red bold]Cancelling current step...[/]"))
+
+    def action_start(self) -> None:
+        if self._started:
+            return
+        if not self._can_start:
+            return
+        self._started = True
+        self._start_time = time.time()
+        self.query_one("#start", Static).add_class("disabled-action")
+        self.query_one("#start", Static).update(" Started ")
+        if self._resume_step_index is not None:
+            self._update_run_header("resuming")
+        else:
+            self._update_run_header("preparing")
+        self._start_preflight()
+        self._run_pipeline()
 
     def action_more_logs(self) -> None:
         key: int | str | None = self._selected_log_index
@@ -1498,7 +1636,9 @@ class RunScreen(Screen):
         return True
 
     def _collect_runtime_variables(self, pipe_vars: dict[str, Any]) -> list[dict[str, str]]:
-        context = {"variables": dict(pipe_vars), "parameters": self._pipeline_info.get("resolved_params", {})}
+        variables = dict(pipe_vars)
+        variables.update(self._pipeline_info.get("resolved_variables", {}))
+        context = {"variables": variables, "parameters": self._pipeline_info.get("resolved_params", {})}
         counters: dict[str, int] = {}
         result: list[dict[str, str]] = []
         for name, value in list(pipe_vars.items()):
@@ -1507,6 +1647,27 @@ class RunScreen(Screen):
                 context["variables"][name] = evaluated
                 result.append({"name": name, "expression": value, "value": evaluated})
         return result
+
+    def _preview_inputs(self, pipe_vars: dict[str, Any], params: dict[str, Any]) -> list[str]:
+        variables = dict(pipe_vars)
+        variables.update(self._pipeline_info.get("resolved_variables", {}))
+        context = {"variables": variables, "parameters": params}
+        counters: dict[str, int] = {}
+        lines = ["Parameter preview:"]
+        if params:
+            for name, value in params.items():
+                lines.append(f"  {name}: {value}")
+        else:
+            lines.append("  (none)")
+        lines.append("")
+        lines.append("Variable preview:")
+        for name, value in list(variables.items()):
+            display = value
+            if isinstance(value, str) and "$[" in value:
+                display = eval_runtime_expression(value, context, counters)
+                context["variables"][name] = display
+            lines.append(f"  {name}: {display}")
+        return lines
 
     def _save_settings(self, settings: LocalSettings) -> None:
         try:
@@ -1536,12 +1697,16 @@ class RunScreen(Screen):
             self._save_settings(settings)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "cancel":
+        if event.button.id == "start":
+            self.action_start()
+        elif event.button.id == "cancel":
             self.action_cancel()
 
     def on_click(self, event: events.Click) -> None:
         if getattr(event.widget, "id", None) == "copy-logs":
             self.action_copy_logs()
+        elif getattr(event.widget, "id", None) == "start":
+            self.action_start()
         elif getattr(event.widget, "id", None) == "cancel":
             self.action_cancel()
 
@@ -1630,6 +1795,10 @@ class RunScreen(Screen):
         if event.node is self._preflight_node:
             self._on_tree_node_clicked(event.node)
             return
+        if id(event.node) in getattr(self, "_extra_node_logs", {}):
+            self._selected_log_index = f"node:{id(event.node)}"
+            self._render_selected_log()
+            return
         try:
             idx = self._step_nodes.index(event.node)
         except ValueError:
@@ -1691,6 +1860,12 @@ class RunScreen(Screen):
         key = self._selected_log_index
         if key == "preflight":
             return ["Initialize job", *self._preflight_logs]
+        if isinstance(key, str) and key.startswith("node:"):
+            try:
+                node_id = int(key.split(":", 1)[1])
+            except ValueError:
+                return []
+            return self._extra_node_logs.get(node_id, [])
         if isinstance(key, int) and 0 <= key < len(self._step_display_names):
             return [str(self._step_display_names[key]), *self._step_logs.get(key, [])]
         return self._all_log_lines[:]
@@ -1712,18 +1887,24 @@ class RunScreen(Screen):
         summary = self.query_one("#run-summary", Static)
         footer = self.query_one("#run-footer", Static)
         color = {
+            "preview": "cyan",
             "completed": "green",
             "cancelled": "red",
             "running": "yellow",
             "preparing": "cyan",
+            "resuming": "cyan",
         }.get(status, "white")
         run_id = datetime.fromtimestamp(self._start_time or time.time()).strftime("%Y%m%d.%H%M%S")
-        title.update(Text.from_markup(f"[bold]Jobs in run #{run_id}[/]  [{color}]{status}[/]"))
+        title_prefix = f"Jobs in run #{run_id}" if self._started else "Pipeline preview"
+        title.update(Text.from_markup(f"[bold]{title_prefix}[/]  [{color}]{status}[/]"))
         summary.update(Text.from_markup(
-            f"[dim]{self._pipeline_info['name']} | Job | elapsed {_format_duration(elapsed)} | {succeeded} succeeded | {failed} failed | {running} running | {total} total[/]"
+            f"[dim]{self._pipeline_info['name']} | elapsed {_format_duration(elapsed)} | {succeeded} succeeded | {failed} failed | {running} running | {total} total[/]"
         ))
-        footer.update(Text.from_markup("[dim]Use arrows/click to select a step, 'm' for more log lines, 'y' or Copy Logs for selected raw log.[/]"))
-        self._update_job_node()
+        if self._started:
+            footer.update(Text.from_markup("[dim]Use arrows/click to select a step, 'm' for more log lines, 'y' or Copy Logs for selected raw log.[/]"))
+            self._update_job_node()
+        else:
+            footer.update(Text.from_markup("[bold cyan]Review the compiled plan, then press Start or 's' to run.[/]"))
 
     def _render_selected_log(self) -> None:
         log = self.query_one("#step-log", RichLog)
@@ -1735,6 +1916,14 @@ class RunScreen(Screen):
             title = "Initialize job"
             status = "running" if self._preflight_active else "completed"
             lines = self._preflight_logs
+        elif isinstance(key, str) and key.startswith("node:"):
+            try:
+                node_id = int(key.split(":", 1)[1])
+            except ValueError:
+                node_id = 0
+            title = self._extra_node_titles.get(node_id, "Preview")
+            status = "preview"
+            lines = self._extra_node_logs.get(node_id, [])
         elif isinstance(key, int) and 0 <= key < len(self._step_display_names):
             title = self._step_display_names[key]
             status = self._step_status.get(key, "pending")
@@ -1772,9 +1961,9 @@ class RunScreen(Screen):
     def _run_pipeline(self) -> None:
         try:
             path = Path(self._pipeline_info["path"])
-            data = load_pipeline_yaml(path)
 
             params = self._pipeline_info.get("resolved_params", {})
+            variable_overrides = self._pipeline_info.get("resolved_variables", {})
             param_defs = self._pipeline_info.get("parameters", [])
             for p in param_defs:
                 if p["name"] not in params and p.get("default") is not None:
@@ -1783,13 +1972,12 @@ class RunScreen(Screen):
                 params.update(self._resume_pipeline.parameters)
                 self._pipeline_info["resolved_params"] = params
 
-            data = expand_template_expressions(data, {"parameters": params})
-            data = process_conditionals(data, {"parameters": params})
+            data = load_and_compile_pipeline(path, params, variable_overrides)
+            params = data.get("parameters", params) if isinstance(data.get("parameters"), dict) else params
+            self._pipeline_info["resolved_params"] = params
 
             if self._resume_step_index is None:
-                task_specs = list(dict.fromkeys(
-                    step["task"] for step in data.get("steps", []) if "task" in step
-                ))
+                task_specs = collect_pipeline_tasks(data)
                 if task_specs:
                     from ado_local.models.config import LocalSettings
                     from ado_local.cache.task_cache import resolve_task
@@ -1856,17 +2044,9 @@ class RunScreen(Screen):
             else:
                 self.app.call_from_thread(self._finish_preflight, False)
 
-            steps_raw = data.get("steps", [])
-            raw_vars = data.get("variables", {})
-            if isinstance(raw_vars, dict):
-                pipe_vars = raw_vars
-            elif isinstance(raw_vars, list):
-                pipe_vars = {}
-                for item in raw_vars:
-                    if isinstance(item, dict) and "name" in item:
-                        pipe_vars[item["name"]] = item.get("value", "")
-            else:
-                pipe_vars = {}
+            pipeline = parse_pipeline_model(data, path)
+            pipe_vars = dict(pipeline.variables)
+            pipe_vars.update(variable_overrides)
 
             if self._resume_pipeline:
                 pipe_vars = dict(self._resume_pipeline.variables)
@@ -1878,66 +2058,13 @@ class RunScreen(Screen):
                 )
                 return
 
-            pipeline = Pipeline(name=self._pipeline_info["name"], variables=pipe_vars, parameters=params)
-            job = Job(name="default")
-
-            for step_idx, step_data in enumerate(steps_raw):
-                if "task" in step_data:
-                    step = TaskStep(
-                        task=step_data["task"],
-                        display_name=step_data.get("displayName", step_data["task"]),
-                        inputs=step_data.get("inputs", {}),
-                        condition=step_data.get("condition"),
-                        continue_on_error=step_data.get("continueOnError", False),
-                        enabled=step_data.get("enabled", True),
-                    )
-                elif "script" in step_data:
-                    step = ScriptStep(
-                        script=step_data["script"],
-                        display_name=step_data.get("displayName", "script"),
-                        condition=step_data.get("condition"),
-                        continue_on_error=step_data.get("continueOnError", False),
-                        enabled=step_data.get("enabled", True),
-                        working_directory=step_data.get("workingDirectory"),
-                    )
-                elif "powershell" in step_data or "pwsh" in step_data:
-                    script_content = step_data.get("powershell") or step_data.get("pwsh", "")
-                    step = ScriptStep(
-                        script=script_content,
-                        display_name=step_data.get("displayName", "powershell"),
-                        condition=step_data.get("condition"),
-                        continue_on_error=step_data.get("continueOnError", False),
-                        enabled=step_data.get("enabled", True),
-                        working_directory=step_data.get("workingDirectory"),
-                    )
-                elif "checkout" in step_data:
-                    step = CheckoutStep(
-                        checkout=step_data.get("checkout", "self"),
-                        display_name=step_data.get("displayName", f"checkout: {step_data.get('checkout', 'self')}"),
-                        submodules=step_data.get("submodules", False),
-                        persist_credentials=step_data.get("persistCredentials", False),
-                        lfs=step_data.get("lfs", False),
-                        path=step_data.get("path"),
-                        condition=step_data.get("condition"),
-                        continue_on_error=step_data.get("continueOnError", False),
-                        enabled=step_data.get("enabled", True),
-                    )
-                elif "publish" in step_data:
-                    step = PublishStep(
-                        publish=str(step_data.get("publish", "")),
-                        artifact=str(step_data.get("artifact", "drop")),
-                        display_name=step_data.get("displayName", f"publish: {step_data.get('publish', '')}"),
-                        condition=step_data.get("condition"),
-                        continue_on_error=step_data.get("continueOnError", False),
-                        enabled=step_data.get("enabled", True),
-                    )
-                else:
-                    continue
-                if self._resume_step_index is not None and step_idx < self._resume_step_index:
-                    step = self._copy_previous_step_state(step_idx, step)
-                job.steps.append(step)
-
-            pipeline.jobs = [job]
+            pipeline.variables = pipe_vars
+            pipeline.parameters = params
+            if self._resume_step_index is not None:
+                for step_idx, step in enumerate(_pipeline_steps_flat(pipeline)):
+                    if step_idx < self._resume_step_index:
+                        previous = self._copy_previous_step_state(step_idx, step)
+                        _replace_pipeline_step(pipeline, step, previous)
             self._pipeline = pipeline
 
             settings = _load_settings()

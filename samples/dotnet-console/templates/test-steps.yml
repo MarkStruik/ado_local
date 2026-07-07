@@ -1,0 +1,24 @@
+parameters:
+- name: project
+  type: string
+- name: configuration
+  type: string
+  default: Release
+- name: expectedOutput
+  type: string
+
+steps:
+- script: dotnet run --project ${{ parameters.project }} --configuration ${{ parameters.configuration }} --no-build -- Pipeline
+  displayName: Run console smoke test
+
+- pwsh: |
+    $actual = dotnet run --project '${{ parameters.project }}' --configuration '${{ parameters.configuration }}' --no-build -- Pipeline
+    if ($actual.Trim() -ne '${{ parameters.expectedOutput }}') {
+      throw "Expected '${{ parameters.expectedOutput }}' but got '$actual'"
+    }
+    Write-Host "Smoke test passed: $actual"
+  displayName: Assert console output
+
+- ${{ if eq(parameters.configuration, 'Debug') }}:
+  - script: echo Debug-only validation path
+    displayName: Debug validation

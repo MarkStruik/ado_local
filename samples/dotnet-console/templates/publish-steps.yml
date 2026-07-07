@@ -1,0 +1,17 @@
+parameters:
+- name: project
+  type: string
+- name: configuration
+  type: string
+  default: Release
+- name: artifactName
+  type: string
+  default: hello-pipeline
+
+steps:
+- script: dotnet publish ${{ parameters.project }} --configuration ${{ parameters.configuration }} --output $(Build.ArtifactStagingDirectory)/${{ parameters.artifactName }}
+  displayName: Publish project
+
+- publish: $(Build.ArtifactStagingDirectory)/${{ parameters.artifactName }}
+  artifact: ${{ parameters.artifactName }}
+  displayName: Publish local artifact

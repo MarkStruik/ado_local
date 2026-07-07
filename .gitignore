@@ -3,10 +3,17 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+bin/
+obj/
+**/bin/
+**/obj/
 .venv/
 _work/
 _tasks/
 _tool/
+_agent_cache/
+_agent_externals/
+_task_list_cache.json
 Artifacts/
 .ado-local.json
 *.egg
@@ -20,5 +27,4 @@ venv/
 *~
 .DS_Store
 Thumbs.db
-.ado-local
-_agent_cache
+.ado-local/

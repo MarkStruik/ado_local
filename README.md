@@ -28,12 +28,16 @@ ADO Local intentionally implements the Azure Pipelines surface area in small, te
 | Local workspace variables | Complete | Emulates core `Build.*`, `Agent.*`, and `System.*` directory variables. |
 | Runtime variable expansion | Complete | Expands `$(VariableName)` in scripts and task inputs. |
 | Logging commands | Complete | Processes common `##vso[...]` commands, including variable updates and issues. |
-| Analysis and prepare commands | Complete | Detects missing variables, parameters, tasks, and service connections from loaded YAML. |
-| Terminal UI | Complete | Provides a local pipeline selector and run display. |
-| Stages and explicit jobs | Future | Models exist, but the headless parser currently materializes root `steps` into one default job. |
-| Azure condition evaluation | Future | Step `condition` fields are captured but not evaluated with Azure-compatible semantics. |
-| YAML template includes | Future | `- template: templates.yaml` should be expanded before analyze, prepare, and run. |
-| Structural template expressions | Future | Azure-style conditional and loop insertion should support mapping/list syntax such as `${{ if ... }}` and `${{ each ... }}`. |
+| Analysis and prepare commands | Complete | Compile templates before detecting missing variables, parameters, tasks, and service connections. |
+| Terminal UI | Complete | Provides pipeline selection, run history, pre-run input review, plan preview, live logs, and result display. |
+| Stages and explicit jobs | First-pass complete | Parses and runs root `stages`, root `jobs`, and root `steps`; headless and TUI output show stage/job/step hierarchy. |
+| Azure condition evaluation | First-pass complete | Evaluates common stage, job, and step `condition` functions such as `succeeded()`, `failed()`, `always()`, `eq()`, `and()`, and `or()`. |
+| YAML template includes | First-pass complete | Expands local `- template: templates.yaml` includes before analyze, prepare, preview, and run. |
+| Structural template expressions | First-pass complete | Supports common mapping/list insertion with `${{ if ... }}` and `${{ each ... }}`. |
+| Parameter and variable overrides | First-pass complete | TUI shows editable parameters and variables before preview; preview shows evaluated parameters and variables before Start. |
+| Remote repository templates | Future | `template.yml@repoAlias` is intentionally not supported yet. |
+| `extends` templates | Future | Include templates are supported first; schema-enforcing `extends` templates remain future work. |
+| Full Azure expression parity | Future | Current expression support covers common local cases but not every Azure Pipelines function or context. |
 
 See `stages-conditionals-templates.md` for the implementation plan for stages, conditions, and template includes.
 

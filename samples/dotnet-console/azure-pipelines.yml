@@ -1,0 +1,81 @@
+# Multi-stage sample pipeline for ADO Local feature parity work.
+
+trigger:
+- main
+
+parameters:
+- name: configuration
+  displayName: Build configuration
+  type: string
+  default: Release
+  values:
+  - Debug
+  - Release
+
+- name: runTests
+  displayName: Run validation stage
+  type: boolean
+  default: true
+
+- name: publishArtifacts
+  displayName: Publish local artifact
+  type: boolean
+  default: true
+
+variables:
+  project: samples/dotnet-console/src/HelloPipeline/HelloPipeline.csproj
+  buildConfiguration: ${{ parameters.configuration }}
+  expectedOutput: Hello from Pipeline sample
+
+stages:
+- stage: Build
+  displayName: Build sample app
+  jobs:
+  - job: Compile
+    displayName: Compile console app
+    steps:
+    - checkout: self
+    - template: templates/build-steps.yml
+      parameters:
+        project: $(project)
+        configuration: ${{ parameters.configuration }}
+
+- stage: Test
+  displayName: Validate sample app
+  condition: eq('${{ parameters.runTests }}', 'true')
+  jobs:
+  - job: SmokeTest
+    displayName: Run smoke tests
+    steps:
+    - template: templates/test-steps.yml
+      parameters:
+        project: $(project)
+        configuration: ${{ parameters.configuration }}
+        expectedOutput: $(expectedOutput)
+
+- stage: Publish
+  displayName: Publish sample output
+  condition: and(succeeded(), eq('${{ parameters.publishArtifacts }}', 'true'))
+  jobs:
+  - job: Package
+    displayName: Package console app
+    steps:
+    - template: templates/publish-steps.yml
+      parameters:
+        project: $(project)
+        configuration: ${{ parameters.configuration }}
+        artifactName: hello-pipeline
+
+- stage: TaskProbe
+  displayName: Skipped Azure task probe
+  condition: eq('false', 'true')
+  jobs:
+  - job: CacheDiscovery
+    displayName: Verify task discovery without running hosted-only behavior
+    steps:
+    - task: DotNetCoreCLI@2
+      displayName: Discover DotNetCoreCLI task
+      inputs:
+        command: build
+        projects: $(project)
+        arguments: --configuration ${{ parameters.configuration }}

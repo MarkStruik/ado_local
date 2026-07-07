@@ -1,0 +1,20 @@
+parameters:
+- name: project
+  type: string
+- name: configuration
+  type: string
+  default: Release
+
+steps:
+- script: echo Building ${{ parameters.project }} with ${{ parameters.configuration }} configuration
+  displayName: Show build inputs
+
+- script: dotnet restore ${{ parameters.project }}
+  displayName: Restore project
+
+- script: dotnet build ${{ parameters.project }} --configuration ${{ parameters.configuration }} --no-restore
+  displayName: Build project
+
+- ${{ if eq(parameters.configuration, 'Release') }}:
+  - script: echo Release-only compile validation
+    displayName: Release build validation

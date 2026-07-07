@@ -5,9 +5,9 @@ from typing import Any, Optional
 
 from ado_local.models.config import LocalSettings
 from ado_local.models.pipeline import Pipeline
-from ado_local.parser.yaml_loader import load_pipeline_yaml
 from ado_local.parser.variable_expander import collect_variable_refs
 from ado_local.cache.task_cache import resolve_task, list_tasks
+from ado_local.parser.pipeline import collect_pipeline_steps
 
 
 class AnalysisResult:
@@ -83,14 +83,7 @@ def analyze_pipeline(
 
 
 def _collect_steps(pipeline_yaml: dict[str, Any]) -> list[dict[str, Any]]:
-    steps: list[dict[str, Any]] = []
-    for stage in pipeline_yaml.get("stages", []):
-        for job in stage.get("jobs", []):
-            steps.extend(job.get("steps", []))
-    for job in pipeline_yaml.get("jobs", []):
-        steps.extend(job.get("steps", []))
-    steps.extend(pipeline_yaml.get("steps", []))
-    return steps
+    return collect_pipeline_steps(pipeline_yaml)
 
 
 def _check_service_connections(pipeline_yaml: dict[str, Any]) -> list[str]:

@@ -9,6 +9,7 @@ from rich.markup import escape
 
 from ado_local import __version__
 from ado_local.models.config import LocalSettings
+from ado_local.models.pipeline import CheckoutStep, PublishStep, ScriptStep, TaskStep
 
 app = typer.Typer(
     name="ado-local",
@@ -47,11 +48,11 @@ def analyze(
 ) -> None:
     """Analyze a pipeline for missing requirements."""
     settings = _load_settings(settings_file)
-    from ado_local.parser.yaml_loader import load_pipeline_yaml
     from ado_local.analysis.analyzer import analyze_pipeline
+    from ado_local.parser.pipeline import load_and_compile_pipeline
 
     try:
-        data = load_pipeline_yaml(pipeline)
+        data = load_and_compile_pipeline(pipeline)
         result = analyze_pipeline(data, settings, Path(settings.task_cache_dir))
 
         from rich.table import Table
@@ -107,17 +108,13 @@ def prepare(
     settings_file: str = typer.Option(".ado-local.json", "--settings", "-s", help="Settings file"),
 ) -> None:
     """Download tasks and tools for offline execution."""
-    from ado_local.parser.yaml_loader import load_pipeline_yaml
-    from ado_local.analysis.analyzer import _collect_steps
+    from ado_local.parser.pipeline import collect_pipeline_tasks, load_and_compile_pipeline
     from ado_local.prepare.downloader import download_task
     settings = _load_settings(settings_file)
 
     try:
-        data = load_pipeline_yaml(pipeline)
-        steps = _collect_steps(data)
-        task_specs = sorted(set(
-            s["task"] for s in steps if "task" in s
-        ))
+        data = load_and_compile_pipeline(pipeline)
+        task_specs = sorted(collect_pipeline_tasks(data))
 
         if not task_specs:
             console.print("[yellow]No tasks found in pipeline.[/]")
@@ -182,96 +179,17 @@ def _run_headless(
         console.print("[red]Error:[/] Pipeline path required in headless mode")
         raise typer.Exit(code=1)
 
-    from ado_local.parser.yaml_loader import load_pipeline_yaml
-    from ado_local.parser.expression import expand_template_expressions
-    from ado_local.parser.template import process_conditionals
+    from ado_local.parser.pipeline import load_and_compile_pipeline, parse_pipeline_model
     from ado_local.execution.engine import PipelineEngine
-    from ado_local.models.pipeline import Pipeline, Job, TaskStep, ScriptStep, CheckoutStep
 
     try:
-        data = load_pipeline_yaml(pipeline)
-
         param_dict: dict[str, str] = {}
         for p in params:
             if "=" in p:
                 k, v = p.split("=", 1)
                 param_dict[k] = v
-
-        raw_params = data.get("parameters", [])
-        if isinstance(raw_params, list):
-            for pdef in raw_params:
-                if isinstance(pdef, dict):
-                    name = pdef.get("name", "")
-                    if name and name not in param_dict and pdef.get("default") is not None:
-                        param_dict[name] = pdef["default"]
-
-        param_context = {"parameters": param_dict}
-        data = expand_template_expressions(data, param_context)
-        data = process_conditionals(data, param_context)
-
-        steps_raw = data.get("steps", [])
-        raw_vars = data.get("variables", {})
-        if isinstance(raw_vars, dict):
-            pipe_vars = raw_vars
-        elif isinstance(raw_vars, list):
-            pipe_vars = {}
-            for item in raw_vars:
-                if isinstance(item, dict) and "name" in item:
-                    pipe_vars[item["name"]] = item.get("value", "")
-                elif isinstance(item, dict) and "group" in item:
-                    pass
-        else:
-            pipe_vars = {}
-        pipe = Pipeline(name=data.get("name", Path(pipeline).stem), variables=pipe_vars)
-        job = Job(name="default")
-
-        for step_data in steps_raw:
-            if "task" in step_data:
-                step = TaskStep(
-                    task=step_data["task"],
-                    display_name=step_data.get("displayName", step_data["task"]),
-                    inputs=step_data.get("inputs", {}),
-                    condition=step_data.get("condition"),
-                    continue_on_error=step_data.get("continueOnError", False),
-                    enabled=step_data.get("enabled", True),
-                )
-            elif "script" in step_data:
-                step = ScriptStep(
-                    script=step_data["script"],
-                    display_name=step_data.get("displayName", "script"),
-                    condition=step_data.get("condition"),
-                    continue_on_error=step_data.get("continueOnError", False),
-                    enabled=step_data.get("enabled", True),
-                    working_directory=step_data.get("workingDirectory"),
-                )
-            elif "powershell" in step_data or "pwsh" in step_data:
-                script_content = step_data.get("powershell") or step_data.get("pwsh", "")
-                step = ScriptStep(
-                    script=script_content,
-                    display_name=step_data.get("displayName", "powershell"),
-                    condition=step_data.get("condition"),
-                    continue_on_error=step_data.get("continueOnError", False),
-                    enabled=step_data.get("enabled", True),
-                    working_directory=step_data.get("workingDirectory"),
-                )
-            elif "checkout" in step_data:
-                step = CheckoutStep(
-                    checkout=step_data.get("checkout", "self"),
-                    display_name=step_data.get("displayName", f"checkout: {step_data.get('checkout', 'self')}"),
-                    submodules=step_data.get("submodules", False),
-                    persist_credentials=step_data.get("persistCredentials", False),
-                    lfs=step_data.get("lfs", False),
-                    path=step_data.get("path"),
-                    condition=step_data.get("condition"),
-                    continue_on_error=step_data.get("continueOnError", False),
-                    enabled=step_data.get("enabled", True),
-                )
-            else:
-                continue
-
-            job.steps.append(step)
-
-        pipe.jobs = [job]
+        data = load_and_compile_pipeline(pipeline, param_dict)
+        pipe = parse_pipeline_model(data, pipeline)
 
         with console.status("[bold blue]Running pipeline...") as status:
             engine = PipelineEngine(settings)
@@ -279,16 +197,19 @@ def _run_headless(
 
         console.print(f"\n[bold]Pipeline Results:[/]")
         all_ok = True
-        for job in pipe.jobs:
+        for stage_name, job in _iter_result_jobs(pipe):
+            if stage_name:
+                console.print(f"  [bold]Stage:[/] {stage_name}")
+            console.print(f"  [bold]Job:[/] {job.display_name or job.name}")
             for step in job.steps:
-                icon = "v" if step.status.value == "succeeded" else "x"
-                color = "green" if step.status.value == "succeeded" else "red"
-                name = step.task if isinstance(step, TaskStep) else type(step).__name__
+                icon = "v" if step.status.value == "succeeded" else "-" if step.status.value == "skipped" else "x"
+                color = "green" if step.status.value == "succeeded" else "dim" if step.status.value == "skipped" else "red"
+                name = _step_result_name(step)
                 dur = f" ({step.duration:.1f}s)" if step.duration else ""
-                console.print(f"  [{color}]{icon}[/] {name}{dur}")
+                console.print(f"    [{color}]{icon}[/] {name}{dur}")
                 for line in step.logs:
-                    console.print(f"    [dim]{escape(line)}[/]")
-                if step.status.value != "succeeded":
+                    console.print(f"      [dim]{escape(line)}[/]")
+                if step.status.value not in ("succeeded", "skipped"):
                     all_ok = False
 
         if all_ok:
@@ -309,6 +230,28 @@ def _run_tui() -> None:
     from ado_local.tui.app import AdoLocalApp
     app = AdoLocalApp()
     app.run()
+
+
+def _iter_result_jobs(pipe):
+    if pipe.stages:
+        for stage in pipe.stages:
+            for job in stage.jobs:
+                yield stage.display_name or stage.name, job
+    else:
+        for job in pipe.jobs:
+            yield None, job
+
+
+def _step_result_name(step) -> str:
+    if isinstance(step, TaskStep):
+        return step.display_name or step.task
+    if isinstance(step, ScriptStep):
+        return step.display_name or "script"
+    if isinstance(step, CheckoutStep):
+        return step.display_name or f"checkout: {step.checkout}"
+    if isinstance(step, PublishStep):
+        return step.display_name or f"publish: {step.publish}"
+    return type(step).__name__
 
 
 @app.command()
