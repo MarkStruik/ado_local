@@ -14,6 +14,29 @@ The project is a Python CLI package named `ado-local`. It parses pipeline YAML, 
 - Provides commands to analyze, prepare, run, and clean local pipeline state.
 - Includes an optional terminal UI when running without a pipeline argument.
 
+## Feature Parity
+
+ADO Local intentionally implements the Azure Pipelines surface area in small, testable slices. The table below tracks current parity with Azure DevOps YAML behavior.
+
+| Area | Status | Notes |
+| --- | --- | --- |
+| Root-level `steps` pipelines | Complete | Runs a simple pipeline as a default local job. |
+| Script steps | Complete | Supports `script`, `powershell`, and `pwsh`. |
+| Task steps | Complete | Resolves cached Azure task packages and can download common task packages. |
+| Checkout steps | Complete | Supports `checkout: self` and `checkout: none` local behavior. |
+| Publish steps | Complete | Publishes artifacts to the local artifact directory. |
+| Local workspace variables | Complete | Emulates core `Build.*`, `Agent.*`, and `System.*` directory variables. |
+| Runtime variable expansion | Complete | Expands `$(VariableName)` in scripts and task inputs. |
+| Logging commands | Complete | Processes common `##vso[...]` commands, including variable updates and issues. |
+| Analysis and prepare commands | Complete | Detects missing variables, parameters, tasks, and service connections from loaded YAML. |
+| Terminal UI | Complete | Provides a local pipeline selector and run display. |
+| Stages and explicit jobs | Future | Models exist, but the headless parser currently materializes root `steps` into one default job. |
+| Azure condition evaluation | Future | Step `condition` fields are captured but not evaluated with Azure-compatible semantics. |
+| YAML template includes | Future | `- template: templates.yaml` should be expanded before analyze, prepare, and run. |
+| Structural template expressions | Future | Azure-style conditional and loop insertion should support mapping/list syntax such as `${{ if ... }}` and `${{ each ... }}`. |
+
+See `stages-conditionals-templates.md` for the implementation plan for stages, conditions, and template includes.
+
 ## Requirements
 
 - Python 3.11 or newer
