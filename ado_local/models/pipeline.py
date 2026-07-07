@@ -156,3 +156,4 @@ class RunRecord(BaseModel):
     duration: float
     pipeline_json: str  # serialized Pipeline
     preflight_logs: list[str] = Field(default_factory=list)
+    workspace_path: str | None = None

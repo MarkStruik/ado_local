@@ -14,6 +14,16 @@ class WorkspaceManager:
         self.run_id = run_id or uuid.uuid4().hex[:12]
         self.root = Path(settings.workspace_root).resolve() / "work" / f"run-{self.run_id}"
 
+    @classmethod
+    def from_existing(cls, settings: LocalSettings, root: str | Path) -> WorkspaceManager:
+        root = Path(root).resolve()
+        run_id = root.name.removeprefix("run-") if root.name.startswith("run-") else uuid.uuid4().hex[:12]
+        self = cls.__new__(cls)
+        self.settings = settings
+        self.run_id = run_id
+        self.root = root
+        return self
+
     def create(self) -> Path:
         self.root.mkdir(parents=True, exist_ok=True)
         for subdir in ["s", "a", "b", "_temp"]:

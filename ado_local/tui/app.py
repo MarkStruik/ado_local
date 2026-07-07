@@ -150,6 +150,93 @@ def _list_run_records(pipeline_path: str) -> list[RunRecord]:
     return records
 
 
+def _run_record_file(rec: RunRecord) -> Path | None:
+    key = _run_history_key(rec.pipeline_path)
+    history_dir = _run_history_dir() / key
+    candidates = [history_dir / f"{rec.timestamp:.0f}.json", history_dir / f"{rec.timestamp}.json"]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    if history_dir.is_dir():
+        for file in history_dir.glob("*.json"):
+            try:
+                data = json.loads(file.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if abs(float(data.get("timestamp", -1)) - rec.timestamp) < 1:
+                return file
+    return None
+
+
+def _safe_remove_work_path(path: str | Path | None) -> None:
+    if not path:
+        return
+    try:
+        import shutil
+
+        target = Path(path).resolve()
+        if not target.is_dir():
+            return
+        parts = {part.lower() for part in target.parts}
+        if ".ado-local" not in parts or "work" not in parts or not target.name.startswith("run-"):
+            return
+        shutil.rmtree(target, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def _remove_work_path_async(path: str | Path | None) -> None:
+    threading.Thread(target=_safe_remove_work_path, args=(path,), daemon=True).start()
+
+
+def _delete_run_record(rec: RunRecord) -> None:
+    try:
+        ts_file = _run_record_file(rec)
+        if ts_file and ts_file.exists():
+            ts_file.unlink()
+        _remove_work_path_async(rec.workspace_path)
+    except Exception:
+        pass
+
+
+def _all_history_workspace_paths() -> set[Path]:
+    paths: set[Path] = set()
+    root = _run_history_dir()
+    if not root.is_dir():
+        return paths
+    for file in root.glob("*/*.json"):
+        try:
+            data = json.loads(file.read_text(encoding="utf-8"))
+            rec = RunRecord(**data)
+            workspace = rec.workspace_path
+            if not workspace and rec.pipeline_json:
+                pipeline = Pipeline.model_validate_json(rec.pipeline_json)
+                workspace = pipeline.workspace_dir
+            if workspace:
+                paths.add(Path(workspace).resolve())
+        except Exception:
+            continue
+    return paths
+
+
+def _cleanup_orphan_workspaces() -> None:
+    try:
+        settings = _load_settings()
+        work_root = (Path(settings.workspace_root).resolve() / "work")
+        if not work_root.is_dir():
+            return
+        referenced = _all_history_workspace_paths()
+        for run_dir in work_root.iterdir():
+            if run_dir.is_dir() and run_dir.name.startswith("run-") and run_dir.resolve() not in referenced:
+                _safe_remove_work_path(run_dir)
+    except Exception:
+        pass
+
+
+def _cleanup_orphan_workspaces_async() -> None:
+    threading.Thread(target=_cleanup_orphan_workspaces, daemon=True).start()
+
+
 def _format_duration(seconds: float | int | None) -> str:
     if seconds is None:
         return ""
@@ -163,7 +250,58 @@ def _format_duration(seconds: float | int | None) -> str:
     return f"{secs}s"
 
 
-def _save_run_record(pipeline_info: dict, pipeline: Pipeline, duration: float, preflight_logs: list[str]) -> None:
+def _copy_text_to_clipboard(text: str) -> None:
+    import subprocess
+
+    try:
+        subprocess.run(
+            ["pwsh", "-NoProfile", "-Command", "Set-Clipboard -Value ([Console]::In.ReadToEnd())"],
+            input=text,
+            text=True,
+            encoding="utf-8",
+            check=True,
+        )
+    except Exception:
+        subprocess.run(["clip"], input=text.encode("utf-16le"), check=True)
+
+
+def _open_path_location(path: str) -> None:
+    import os
+    import subprocess
+    import sys
+
+    target = Path(path)
+    if target.is_file():
+        target = target.parent
+    if os.name == "nt":
+        os.startfile(str(target))  # type: ignore[attr-defined]
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", str(target)])
+    else:
+        subprocess.Popen(["xdg-open", str(target)])
+
+
+def _artifact_path_from_logs(logs: list[str]) -> str | None:
+    for line in reversed(logs):
+        if line.startswith("Published artifact:"):
+            path = line.split(":", 1)[1].strip()
+            return path or None
+    return None
+
+
+def _pipeline_artifacts(pipeline: Pipeline) -> list[tuple[str, str]]:
+    artifacts: list[tuple[str, str]] = []
+    for job in pipeline.jobs:
+        for step in job.steps:
+            if isinstance(step, PublishStep):
+                path = step.artifact_path or _artifact_path_from_logs(step.logs)
+                if path:
+                    name = Path(path).name or step.artifact or path
+                    artifacts.append((name, path))
+    return artifacts
+
+def _save_run_record(pipeline_info: dict, pipeline: Pipeline, duration: float,
+                      preflight_logs: list[str]) -> None:
     try:
         rec = RunRecord(
             pipeline_name=pipeline_info.get("name", pipeline.name or ""),
@@ -172,6 +310,7 @@ def _save_run_record(pipeline_info: dict, pipeline: Pipeline, duration: float, p
             duration=duration,
             pipeline_json=pipeline.model_dump_json(),
             preflight_logs=preflight_logs,
+            workspace_path=pipeline.workspace_dir,
         )
         key = _run_history_key(rec.pipeline_path)
         history_dir = _run_history_dir() / key
@@ -185,8 +324,10 @@ class RunHistoryScreen(Screen):
     BINDINGS = [
         Binding("escape", "back", "Back"),
         Binding("r", "new_run", "New Run"),
+        Binding("a", "open_artifact", "Open Artifact"),
         Binding("j", "cursor_down", "Down"),
         Binding("k", "cursor_up", "Up"),
+        Binding("d", "delete_run", "Delete"),
     ]
 
     def action_cursor_down(self) -> None:
@@ -206,12 +347,17 @@ class RunHistoryScreen(Screen):
     def __init__(self, pipeline_info: dict[str, Any]) -> None:
         super().__init__()
         self._pipeline_info = pipeline_info
+        self._history_artifacts: dict[int, list[tuple[str, str]]] = {}
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield Container(
             Static(f"[bold]Run History:[/] {self._pipeline_info['name']}", id="history-title"),
-            Static(" New Run ", id="new-run", classes="raw-log-action success-action"),
+            Horizontal(
+                Static(" New Run ", id="new-run", classes="raw-log-action success-action"),
+                Static(" Open Artifact ", id="open-artifact", classes="raw-log-action"),
+                id="history-actions",
+            ),
             DataTable(id="history-table"),
             Static(" Back ", id="back", classes="raw-log-action"),
             id="history-container",
@@ -221,21 +367,31 @@ class RunHistoryScreen(Screen):
     def on_mount(self) -> None:
         table = self.query_one("#history-table", DataTable)
         table.cursor_type = "row"
-        table.add_columns("#", "Status", "Duration", "Date")
+        table.add_columns("#", "Status", "Duration", "Artifacts", "Date")
+        self._populate_history_table(table)
+        records = _list_run_records(self._pipeline_info["path"])
+        if records:
+            table.move_cursor(row=0)
+        table.focus()
+
+    def _populate_history_table(self, table: DataTable) -> None:
+        self._history_artifacts.clear()
         records = _list_run_records(self._pipeline_info["path"])
         for i, rec in enumerate(records, 1):
             try:
                 p = Pipeline.model_validate_json(rec.pipeline_json)
                 all_ok = all(s.status == StepStatus.SUCCEEDED for job in p.jobs for s in job.steps)
                 status = "[green]SUCCEEDED[/]" if all_ok else "[red]FAILED[/]"
+                artifacts = _pipeline_artifacts(p)
             except Exception:
                 status = "[dim]UNKNOWN[/]"
+                artifacts = []
+            if artifacts:
+                self._history_artifacts[i - 1] = artifacts
+            artifact_text = f"📦 {len(artifacts)}" if len(artifacts) > 1 else "📦" if artifacts else ""
             dur = _format_duration(rec.duration)
             date_str = datetime.fromtimestamp(rec.timestamp).strftime("%Y-%m-%d %H:%M")
-            table.add_row(str(i), status, dur, date_str)
-        if records:
-            table.move_cursor(row=0)
-        table.focus()
+            table.add_row(str(i), status, dur, artifact_text, date_str)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "new-run":
@@ -246,6 +402,8 @@ class RunHistoryScreen(Screen):
     def on_click(self, event: events.Click) -> None:
         if getattr(event.widget, "id", None) == "new-run":
             self._start_new_run()
+        elif getattr(event.widget, "id", None) == "open-artifact":
+            self.action_open_artifact()
         elif getattr(event.widget, "id", None) == "back":
             self.app.pop_screen()
 
@@ -261,6 +419,32 @@ class RunHistoryScreen(Screen):
         else:
             self.app.push_screen(RunScreen(self._pipeline_info))
 
+    def action_delete_run(self) -> None:
+        table = self.query_one("#history-table", DataTable)
+        if table.row_count == 0:
+            return
+        idx = table.cursor_row
+        if idx is None:
+            idx = 0
+        records = _list_run_records(self._pipeline_info["path"])
+        if 0 <= idx < len(records):
+            rec = records[idx]
+            _delete_run_record(rec)
+            table.clear()
+            self._populate_history_table(table)
+            records = _list_run_records(self._pipeline_info["path"])
+            if records:
+                table.move_cursor(row=min(idx, len(records) - 1))
+
+    def action_open_artifact(self) -> None:
+        table = self.query_one("#history-table", DataTable)
+        idx = table.cursor_row
+        if idx is None:
+            idx = 0
+        artifacts = self._history_artifacts.get(idx, [])
+        if artifacts:
+            _open_path_location(artifacts[0][1])
+
     def action_view_run(self) -> None:
         table = self.query_one("#history-table", DataTable)
         if table.row_count == 0:
@@ -274,7 +458,10 @@ class RunHistoryScreen(Screen):
             rec = records[idx]
             try:
                 pipeline = Pipeline.model_validate_json(rec.pipeline_json)
-                self.app.push_screen(RunResultScreen(pipeline, rec.duration, rec.preflight_logs, double_pop=False))
+                pipeline_info = parse_pipeline_info(Path(rec.pipeline_path))
+                self.app.push_screen(RunResultScreen(pipeline, rec.duration, rec.preflight_logs,
+                                                       double_pop=False, pipeline_info=pipeline_info,
+                                                       run_timestamp=rec.timestamp))
             except Exception as e:
                 self.query_one("#history-container", Container).mount(
                     Static(f"[red]Failed to load run: {e}[/]")
@@ -351,10 +538,10 @@ class PipelineSelectScreen(Screen):
             ListView(id="pipeline-list"),
             Static("", id="pipeline-info"),
             Horizontal(
-                Button("Analyze", id="analyze", variant="primary"),
-                Button("Run", id="run", variant="success"),
-                Button("Refresh", id="refresh"),
-                Button("Quit", id="quit", variant="error"),
+                Static(" Analyze ", id="analyze", classes="raw-log-action"),
+                Static(" Run ", id="run", classes="raw-log-action success-action"),
+                Static(" Refresh ", id="refresh", classes="raw-log-action"),
+                Static(" Quit ", id="quit", classes="raw-log-action danger-action"),
                 id="buttons",
             ),
             id="main-container",
@@ -379,12 +566,12 @@ class PipelineSelectScreen(Screen):
         if not pipelines:
             list_view.append(ListItem(Static("[red]No pipeline files found.[/]")))
             info_static.update("[yellow]Create azure-pipelines.yml in this directory[/]")
-            self.query_one("#run", Button).disabled = True
-            self.query_one("#analyze", Button).disabled = True
+            self.query_one("#run", Static).add_class("disabled-action")
+            self.query_one("#analyze", Static).add_class("disabled-action")
             return
 
-        self.query_one("#run", Button).disabled = False
-        self.query_one("#analyze", Button).disabled = False
+        self.query_one("#run", Static).remove_class("disabled-action")
+        self.query_one("#analyze", Static).remove_class("disabled-action")
 
         for p in pipelines:
             info = parse_pipeline_info(p)
@@ -433,6 +620,17 @@ class PipelineSelectScreen(Screen):
         elif event.button.id == "quit":
             self.app.exit()
 
+    def on_click(self, event: events.Click) -> None:
+        widget_id = getattr(event.widget, "id", None)
+        if widget_id == "run":
+            self._run_selected()
+        elif widget_id == "analyze":
+            self._analyze_selected()
+        elif widget_id == "refresh":
+            self._load_pipelines()
+        elif widget_id == "quit":
+            self.app.exit()
+
     def _run_selected(self) -> None:
         if self._selected_index is not None and self._selected_index < len(self._pipeline_info):
             info = self._pipeline_info[self._selected_index]
@@ -472,8 +670,8 @@ class ParameterScreen(Screen):
             Static(f"[bold]Parameters for:[/] {self._pipeline_info['name']}", id="param-title"),
             VerticalScroll(id="param-fields"),
             Horizontal(
-                Button("Run", id="run-params", variant="success"),
-                Button("Back", id="back"),
+                Static(" Run ", id="run-params", classes="raw-log-action success-action"),
+                Static(" Back ", id="back", classes="raw-log-action"),
                 id="param-buttons",
             ),
             id="param-container",
@@ -500,6 +698,13 @@ class ParameterScreen(Screen):
         if event.button.id == "run-params":
             self._do_run()
         elif event.button.id == "back":
+            self.app.pop_screen()
+
+    def on_click(self, event: events.Click) -> None:
+        widget_id = getattr(event.widget, "id", None)
+        if widget_id == "run-params":
+            self._do_run()
+        elif widget_id == "back":
             self.app.pop_screen()
 
     def _do_run(self) -> None:
@@ -530,8 +735,9 @@ class RuntimeVariablesDialog(ModalScreen[dict[str, str] | None]):
             Static("Review evaluated formulas before this run.", classes="muted"),
             VerticalScroll(id="runtime-vars-fields"),
             Horizontal(
-                Button("Continue", variant="primary", id="runtime-vars-run"),
-                Button("Cancel", variant="error", id="runtime-vars-cancel"),
+                Static(" Continue ", id="runtime-vars-run", classes="raw-log-action success-action"),
+                Static(" Cancel ", id="runtime-vars-cancel", classes="raw-log-action danger-action"),
+                id="runtime-vars-buttons",
             ),
             id="runtime-vars-dialog",
         )
@@ -547,6 +753,16 @@ class RuntimeVariablesDialog(ModalScreen[dict[str, str] | None]):
         if event.button.id == "runtime-vars-cancel":
             self.dismiss(None)
             return
+        self._dismiss_runtime_vars()
+
+    def on_click(self, event: events.Click) -> None:
+        widget_id = getattr(event.widget, "id", None)
+        if widget_id == "runtime-vars-cancel":
+            self.dismiss(None)
+        elif widget_id == "runtime-vars-run":
+            self._dismiss_runtime_vars()
+
+    def _dismiss_runtime_vars(self) -> None:
         values: dict[str, str] = {}
         for item in self._variables:
             name = item["name"]
@@ -569,7 +785,7 @@ class AnalyzeScreen(Screen):
             Static(f"[bold]Analysis:[/] {self._pipeline_info['name']}", id="analysis-title"),
             LoadingIndicator(),
             Log(id="analysis-log"),
-            Button("Back", id="back", variant="primary"),
+            Static(" Back ", id="back", classes="raw-log-action"),
             id="analysis-container",
         )
         yield Footer()
@@ -625,6 +841,10 @@ class AnalyzeScreen(Screen):
         if event.button.id == "back":
             self.app.pop_screen()
 
+    def on_click(self, event: events.Click) -> None:
+        if getattr(event.widget, "id", None) == "back":
+            self.app.pop_screen()
+
     def action_back(self) -> None:
         self.app.pop_screen()
 
@@ -643,26 +863,33 @@ class RunResultScreen(ModalScreen):
         Binding("c", "close", "Close"),
         Binding("y", "copy_logs", "Copy Logs"),
         Binding("m", "more_logs", "More Logs"),
+        Binding("d", "close_and_delete", "Delete"),
+        Binding("r", "restart_from_step", "Restart Step"),
     ]
 
-    def __init__(self, pipeline: Pipeline, duration: float, preflight_logs: list[str] | None = None, double_pop: bool = True) -> None:
+    def __init__(self, pipeline: Pipeline, duration: float, preflight_logs: list[str] | None = None,
+                 double_pop: bool = True, pipeline_info: dict[str, Any] | None = None,
+                 run_timestamp: float | None = None) -> None:
         super().__init__()
         self._pipeline = pipeline
         self._duration = duration
         self._preflight_logs = preflight_logs or []
         self._all_log_lines: list[str] = []
         self._double_pop = double_pop
+        self._pipeline_info = pipeline_info
+        self._run_timestamp = run_timestamp
         self._selected_result_node: TreeNode | None = None
         self._visible_result_lines: dict[int, int] = {}
         self._node_status: dict[int, str] = {}
+        self._restart_step_index: int | None = None
+        self._artifact_paths: dict[str, str] = {}
 
     def action_copy_logs(self) -> None:
-        import subprocess
-        text = "\n".join(self._collect_result_logs())
+        text = "\n".join(self._selected_result_log_lines())
         try:
-            subprocess.run(["clip"], input=text, text=True, check=True)
+            _copy_text_to_clipboard(text)
             log = self.query_one("#result-log", RichLog)
-            log.write(Text.from_markup("[dim]Full raw run log copied to clipboard[/]"))
+            log.write(Text.from_markup("[dim]Selected raw log copied to clipboard[/]"))
         except Exception as e:
             log = self.query_one("#result-log", RichLog)
             log.write(Text.from_markup(f"[red]Copy failed: {e}[/]"))
@@ -671,6 +898,7 @@ class RunResultScreen(ModalScreen):
         yield Container(
             Static("", id="result-title"),
             Static("", id="result-duration"),
+            Horizontal(id="result-artifacts"),
             Horizontal(
                 Vertical(
                     Static("[bold]Steps[/]", id="result-steps-header"),
@@ -687,11 +915,15 @@ class RunResultScreen(ModalScreen):
                     RichLog(id="result-log", highlight=True, markup=True, wrap=True, max_lines=1000),
                     id="result-logs-panel",
                 ),
-                id="result-panels",
-            ),
-            Static(" Close ", id="close", classes="raw-log-action"),
-            id="result-container",
-        )
+                    id="result-panels",
+                ),
+                Horizontal(
+                    Static(" Restart Step ", id="restart-step", classes="raw-log-action"),
+                    Static(" Close ", id="close", classes="raw-log-action"),
+                    id="result-footer",
+                ),
+                id="result-container",
+            )
 
     def on_mount(self) -> None:
         tree = self.query_one("#result-tree", Tree)
@@ -721,21 +953,19 @@ class RunResultScreen(ModalScreen):
         self._node_status[id(preflight_node)] = "completed"
 
         for job in self._pipeline.jobs:
-            for step in job.steps:
+            for step_idx, step in enumerate(job.steps):
                 icon = self.ICON_SUCCEEDED if step.status == StepStatus.SUCCEEDED else self.ICON_FAILED if step.status == StepStatus.FAILED else self.ICON_SKIPPED
                 dur = _format_duration(step.duration) if step.duration else ""
                 color = "green" if step.status == StepStatus.SUCCEEDED else "red" if step.status == StepStatus.FAILED else "dim"
                 label = getattr(step, "display_name", None) or getattr(step, "task", type(step).__name__)
-                suffix = ""
-                if isinstance(step, PublishStep) and step.artifact_path:
-                    suffix = f" [link=file:///{step.artifact_path}]{step.artifact_path}[/]"
                 row = self._format_step_row(str(label), dur)
-                node = job_node.add_leaf(f"[{color}]{icon}[/] {row}{suffix}")
-                node.data = step.logs[:]
+                node = job_node.add_leaf(f"[{color}]{icon}[/] {row}")
+                node.data = (step_idx, step.logs[:])
                 self._node_status[id(node)] = step.status.value if isinstance(step.status, StepStatus) else str(step.status)
 
         tree.root.expand_all()
         self._update_result_header(all_succeeded, succeeded, failed)
+        self._render_artifacts()
 
         self._selected_result_node = preflight_node
         self._render_result_node(preflight_node)
@@ -759,7 +989,11 @@ class RunResultScreen(ModalScreen):
         detail = self.query_one("#result-step-detail", Static)
         log.clear()
         title = node.label.plain.strip()
-        lines = list(node.data or [])
+        raw = node.data
+        if isinstance(raw, tuple):
+            step_idx, lines = raw
+        else:
+            step_idx, lines = None, (raw or [])
         visible = self._visible_result_lines.get(id(node), self.DEFAULT_LOG_TAIL_LINES)
         shown_lines = lines[-visible:] if len(lines) > visible else lines
         status = self._node_status.get(id(node), "completed")
@@ -792,6 +1026,33 @@ class RunResultScreen(ModalScreen):
             f"[dim]{self._pipeline.name} | Job | elapsed {_format_duration(self._duration)} | {succeeded} succeeded | {failed} failed[/]"
         ))
 
+    def _render_artifacts(self) -> None:
+        container = self.query_one("#result-artifacts", Horizontal)
+        self._artifact_paths.clear()
+        artifacts: list[tuple[str, str]] = []
+        for job in self._pipeline.jobs:
+            for step in job.steps:
+                if isinstance(step, PublishStep):
+                    path = step.artifact_path or self._artifact_path_from_logs(step.logs)
+                    if path:
+                        name = Path(path).name or step.artifact or path
+                        artifacts.append((name, path))
+        if not artifacts:
+            container.display = False
+            return
+        container.display = True
+        for index, (name, path) in enumerate(artifacts):
+            artifact_id = f"artifact-{index}"
+            self._artifact_paths[artifact_id] = path
+            container.mount(Static(f" 📦 {name} ", id=artifact_id, classes="artifact-link"))
+
+    def _artifact_path_from_logs(self, logs: list[str]) -> str | None:
+        for line in reversed(logs):
+            if line.startswith("Published artifact:"):
+                path = line.split(":", 1)[1].strip()
+                return path or None
+        return None
+
     def _collect_result_logs(self) -> list[str]:
         lines: list[str] = [f"Jobs in run: {self._pipeline.name}", f"Duration: {_format_duration(self._duration)}", ""]
         if self._preflight_logs:
@@ -805,6 +1066,17 @@ class RunResultScreen(ModalScreen):
                 lines.extend(step.logs)
                 lines.append("")
         return lines
+
+    def _selected_result_log_lines(self) -> list[str]:
+        if not self._selected_result_node or not self._selected_result_node.data:
+            return self._collect_result_logs()
+        title = self._selected_result_node.label.plain.strip()
+        raw = self._selected_result_node.data
+        if isinstance(raw, tuple):
+            _, lines = raw
+        else:
+            lines = raw or []
+        return [title, *[str(line) for line in lines]]
 
     def _format_step_row(self, label: str, duration: str = "") -> str:
         if len(label) > self.STEP_NAME_WIDTH:
@@ -820,8 +1092,46 @@ class RunResultScreen(ModalScreen):
             self.action_copy_logs()
         elif getattr(event.widget, "id", None) == "close":
             self._do_close()
+        elif getattr(event.widget, "id", None) == "restart-step":
+            self.action_restart_from_step()
+        elif getattr(event.widget, "id", None) in self._artifact_paths:
+            _open_path_location(self._artifact_paths[getattr(event.widget, "id")])
 
     def action_close(self) -> None:
+        self._do_close()
+
+    def action_restart_from_step(self) -> None:
+        if not self._selected_result_node or not self._selected_result_node.data:
+            return
+        raw = self._selected_result_node.data
+        if not isinstance(raw, tuple):
+            return
+        step_idx, _ = raw
+        if step_idx is None:
+            return
+        workspace_path = self._pipeline.workspace_dir
+        if not workspace_path or not Path(workspace_path).is_dir():
+            return
+        path = self._pipeline_info["path"] if self._pipeline_info else None
+        if not path or not Path(path).is_file():
+            return
+        pipeline_info = parse_pipeline_info(Path(path))
+        pipeline_info["resolved_params"] = dict(self._pipeline.parameters)
+        self.app.pop_screen()
+        if self._double_pop:
+            self.app.pop_screen()
+        self.app.push_screen(RunScreen(pipeline_info, resume_step_index=step_idx,
+                                        resume_workspace_path=workspace_path,
+                                        resume_pipeline=self._pipeline))
+
+    def action_close_and_delete(self) -> None:
+        path = self._pipeline_info["path"] if self._pipeline_info else None
+        if path:
+            records = _list_run_records(path)
+            for rec in records:
+                if self._run_timestamp and abs(rec.timestamp - self._run_timestamp) < 1.0:
+                    _delete_run_record(rec)
+                    break
         self._do_close()
 
     def _do_close(self) -> None:
@@ -843,8 +1153,9 @@ class PATDialog(ModalScreen):
             Input(placeholder="Personal Access Token (PAT)", password=True, id="token-input"),
             Input(placeholder="Project (optional)", id="project-input"),
             Horizontal(
-                Button("Save & Download", variant="primary", id="save-btn"),
-                Button("Skip", variant="error", id="skip-btn"),
+                Static(" Save & Download ", id="save-btn", classes="raw-log-action success-action"),
+                Static(" Skip ", id="skip-btn", classes="raw-log-action danger-action"),
+                id="pat-buttons",
             ),
             id="pat-container",
         )
@@ -861,14 +1172,28 @@ class PATDialog(ModalScreen):
         else:
             self.dismiss(None)
 
+    def on_click(self, event: events.Click) -> None:
+        widget_id = getattr(event.widget, "id", None)
+        if widget_id == "save-btn":
+            org = self.query_one("#org-input", Input).value.strip()
+            token = self.query_one("#token-input", Input).value.strip()
+            project = self.query_one("#project-input", Input).value.strip()
+            if org and token:
+                self.dismiss((org, token, project))
+            else:
+                self.query_one("#pat-title", Label).update("[red]Organization and Token are required[/]")
+        elif widget_id == "skip-btn":
+            self.dismiss(None)
+
 
 class RetryDialog(ModalScreen[bool]):
     def compose(self) -> ComposeResult:
         yield Container(
             Label("Some tasks could not be resolved.\nContinue anyway?"),
             Horizontal(
-                Button("Continue", variant="primary", id="continue-btn"),
-                Button("Cancel", variant="error", id="cancel-btn"),
+                Static(" Continue ", id="continue-btn", classes="raw-log-action success-action"),
+                Static(" Cancel ", id="cancel-btn", classes="raw-log-action danger-action"),
+                id="retry-buttons",
             ),
             id="retry-container",
         )
@@ -877,6 +1202,12 @@ class RetryDialog(ModalScreen[bool]):
         if event.button.id == "continue-btn":
             self.dismiss(True)
         else:
+            self.dismiss(False)
+
+    def on_click(self, event: events.Click) -> None:
+        if getattr(event.widget, "id", None) == "continue-btn":
+            self.dismiss(True)
+        elif getattr(event.widget, "id", None) == "cancel-btn":
             self.dismiss(False)
 
 
@@ -896,7 +1227,10 @@ class RunScreen(Screen):
         Binding("m", "more_logs", "More Logs"),
     ]
 
-    def __init__(self, pipeline_info: dict[str, Any]) -> None:
+    def __init__(self, pipeline_info: dict[str, Any],
+                 resume_step_index: int | None = None,
+                 resume_workspace_path: str | None = None,
+                 resume_pipeline: Pipeline | None = None) -> None:
         super().__init__()
         self._pipeline_info = pipeline_info
         self._pipeline: Optional[Pipeline] = None
@@ -919,6 +1253,9 @@ class RunScreen(Screen):
         self._preflight_duration: float | None = None
         self._spinner_index: int = 0
         self._last_log_render_at: float = 0.0
+        self._resume_step_index: int | None = resume_step_index
+        self._resume_workspace_path: str | None = resume_workspace_path
+        self._resume_pipeline: Pipeline | None = resume_pipeline
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -957,12 +1294,18 @@ class RunScreen(Screen):
         self._build_step_tree()
         self.set_interval(0.15, self._tick_spinner)
         self._log_widget = self.query_one("#step-log", RichLog)
-        self._update_run_header("preparing")
+        if self._resume_step_index is not None:
+            self._update_run_header("resuming")
+        else:
+            self._update_run_header("preparing")
         self._start_preflight()
         self._run_pipeline()
 
     def _write_log(self, msg: str) -> None:
-        text = Text.from_markup(msg)
+        try:
+            text = Text.from_markup(msg)
+        except Exception:
+            text = Text(msg)
         self._all_log_lines.append(text.plain)
         if self._selected_log_index == "preflight":
             self.app.call_from_thread(self._render_selected_log_throttled)
@@ -1045,11 +1388,26 @@ class RunScreen(Screen):
             if isinstance(name, dict):
                 name = str(list(name.keys())[0]) if name else f"step {i}"
             display = step_data.get("displayName", name)
-            node = job_node.add_leaf(Text.assemble((self.ICON_PENDING, "dim"), " ", (self._format_step_row(str(display)), "")))
+            previous = self._previous_step(i) if self._resume_step_index is not None and i < self._resume_step_index else None
+            if previous is not None:
+                status = previous.status.value if isinstance(previous.status, StepStatus) else str(previous.status)
+                icon = self.ICON_SUCCEEDED if previous.status == StepStatus.SUCCEEDED else self.ICON_FAILED if previous.status == StepStatus.FAILED else self.ICON_SKIPPED
+                style = "green" if previous.status == StepStatus.SUCCEEDED else "red" if previous.status == StepStatus.FAILED else "dim"
+                duration = _format_duration(previous.duration) if previous.duration else ""
+            else:
+                status = "pending"
+                icon = self.ICON_PENDING
+                style = "dim"
+                duration = ""
+            node = job_node.add_leaf(Text.assemble((icon, style), " ", (self._format_step_row(str(display), duration), "")))
             self._step_nodes.append(node)
             self._step_data.append(step_data)
             self._step_display_names.append(display)
-            self._step_status[i] = "pending"
+            self._step_status[i] = status
+            if previous is not None:
+                self._step_logs[i] = previous.logs[:]
+                if previous.duration is not None:
+                    self._step_durations[i] = previous.duration
 
         tree.root.expand()
         job_node.expand_all()
@@ -1061,11 +1419,10 @@ class RunScreen(Screen):
         return self._cancelled
 
     def action_copy_logs(self) -> None:
-        import subprocess
-        text = "\n".join(self._all_log_lines)
+        text = "\n".join(self._selected_live_log_lines())
         try:
-            subprocess.run(["clip"], input=text, text=True, check=True)
-            self._log_widget.write(Text.from_markup("[dim]Full raw run log copied to clipboard[/]"))
+            _copy_text_to_clipboard(text)
+            self._log_widget.write(Text.from_markup("[dim]Selected raw log copied to clipboard[/]"))
         except Exception as e:
             self._log_widget.write(Text.from_markup(f"[red]Copy failed: {e}[/]"))
 
@@ -1262,7 +1619,9 @@ class RunScreen(Screen):
                 footer.update(Text.from_markup(f"[green bold]Pipeline complete in {_format_duration(duration)}[/]"))
                 self._update_run_header("completed")
             _save_run_record(self._pipeline_info, self._pipeline, duration, self._preflight_logs)
-            self.app.push_screen(RunResultScreen(self._pipeline, duration, self._preflight_logs))
+            self.app.push_screen(RunResultScreen(self._pipeline, duration, self._preflight_logs,
+                                                   pipeline_info=self._pipeline_info,
+                                                   run_timestamp=time.time()))
 
         if event.event_type != EventType.PIPELINE_COMPLETE:
             self._update_run_header("running")
@@ -1310,6 +1669,32 @@ class RunScreen(Screen):
             label = label[: self.STEP_NAME_WIDTH - 1] + "…"
         return f"{label:<{self.STEP_NAME_WIDTH}} {duration:>8}"
 
+    def _previous_step(self, index: int) -> Any | None:
+        if not self._resume_pipeline or not self._resume_pipeline.jobs:
+            return None
+        steps = self._resume_pipeline.jobs[0].steps
+        if 0 <= index < len(steps):
+            return steps[index]
+        return None
+
+    def _copy_previous_step_state(self, index: int, step: Any) -> Any:
+        previous = self._previous_step(index)
+        if previous is None:
+            return step
+        for attr in ("status", "logs", "start_time", "end_time", "exit_code", "artifact_path"):
+            if hasattr(step, attr) and hasattr(previous, attr):
+                value = getattr(previous, attr)
+                setattr(step, attr, value[:] if isinstance(value, list) else value)
+        return step
+
+    def _selected_live_log_lines(self) -> list[str]:
+        key = self._selected_log_index
+        if key == "preflight":
+            return ["Initialize job", *self._preflight_logs]
+        if isinstance(key, int) and 0 <= key < len(self._step_display_names):
+            return [str(self._step_display_names[key]), *self._step_logs.get(key, [])]
+        return self._all_log_lines[:]
+
     def _on_tree_node_clicked(self, node: TreeNode, idx: int | None = None) -> None:
         if node is self._preflight_node:
             self._selected_log_index = "preflight"
@@ -1337,7 +1722,7 @@ class RunScreen(Screen):
         summary.update(Text.from_markup(
             f"[dim]{self._pipeline_info['name']} | Job | elapsed {_format_duration(elapsed)} | {succeeded} succeeded | {failed} failed | {running} running | {total} total[/]"
         ))
-        footer.update(Text.from_markup("[dim]Use arrows/click to select a step, 'm' for more log lines, 'y' or Copy Logs for full run log.[/]"))
+        footer.update(Text.from_markup("[dim]Use arrows/click to select a step, 'm' for more log lines, 'y' or Copy Logs for selected raw log.[/]"))
         self._update_job_node()
 
     def _render_selected_log(self) -> None:
@@ -1394,74 +1779,80 @@ class RunScreen(Screen):
             for p in param_defs:
                 if p["name"] not in params and p.get("default") is not None:
                     params[p["name"]] = p["default"]
+            if self._resume_pipeline and self._resume_pipeline.parameters:
+                params.update(self._resume_pipeline.parameters)
+                self._pipeline_info["resolved_params"] = params
 
             data = expand_template_expressions(data, {"parameters": params})
             data = process_conditionals(data, {"parameters": params})
 
-            task_specs = list(dict.fromkeys(
-                step["task"] for step in data.get("steps", []) if "task" in step
-            ))
-            if task_specs:
-                from ado_local.models.config import LocalSettings
-                from ado_local.cache.task_cache import resolve_task
-                from ado_local.execution.checkout import detect_git_remote, parse_azure_devops_remote
-                settings = _load_settings()
-                cache_dir = Path(settings.task_cache_dir)
-                all_found = True
-                for spec in task_specs:
-                    msg = f"[dim]  {spec}...[/]"
-                    self._preflight_logs.append(f"  {spec}...")
-                    self._write_log(msg)
-                    result = resolve_task(
-                        spec, cache_dir, auto_download=True,
-                        log_callback=lambda m: self._preflight_logs.append(
-                            m.removeprefix("  ") if m.startswith("  ") else m
-                        ) or self._write_log(f"[dim]{m}[/]"),
-                    )
-                    if result is None:
-                        if not settings.azure_devops_token or not settings.azure_devops_org:
-                            self._prompt_for_pat(settings)
-                        ado_retries = 0
-                        while ado_retries < 2 and settings.azure_devops_token and settings.azure_devops_org:
-                            self._preflight_logs.append(f"  Retrying via Azure DevOps...")
-                            self._write_log("[dim]  Retrying via Azure DevOps...[/]")
-                            result = resolve_task(
-                                spec, cache_dir, auto_download=False,
-                                azure_devops_token=settings.azure_devops_token,
-                                azure_devops_org=settings.azure_devops_org,
-                                azure_devops_project=settings.azure_devops_project,
-                                log_callback=lambda m: self._preflight_logs.append(
-                                    m.removeprefix("  ") if m.startswith("  ") else m
-                                ) or self._write_log(f"[dim]{m}[/]"),
-                            )
-                            if result is not None:
-                                break
-                            ado_retries += 1
-                            if ado_retries < 2:
-                                self._preflight_logs.append(f"  ADO download failed — you may need to update your PAT")
-                                self._write_log("[yellow]  ADO download failed — you may need to update your PAT[/]")
-                                self._prompt_for_pat(settings)
-                    if result is None:
-                        self._preflight_logs.append(f"  {spec} NOT FOUND")
-                        self._write_log(f"[yellow]  {spec} NOT FOUND (will fail)[/]")
-                        all_found = False
-                    else:
-                        line = f"  {spec} -> {result.name} {result.resolved_version}"
-                        self._preflight_logs.append(line)
-                        self._write_log(f"[green]{line}[/]")
-                self.app.call_from_thread(self._finish_preflight, not all_found)
-                if not all_found:
-                    self._preflight_continue_event = threading.Event()
-                    self._preflight_continue_value = False
-                    self.app.call_from_thread(self._show_retry_dialog)
-                    self._preflight_continue_event.wait()
-                    if not self._preflight_continue_value:
-                        cancelled_pipeline = Pipeline(name=self._pipeline_info["name"])
-                        cancelled_pipeline.jobs = [Job(name="default")]
-                        self.app.call_from_thread(
-                            self.app.push_screen, RunResultScreen(cancelled_pipeline, 0.0, self._preflight_logs)
+            if self._resume_step_index is None:
+                task_specs = list(dict.fromkeys(
+                    step["task"] for step in data.get("steps", []) if "task" in step
+                ))
+                if task_specs:
+                    from ado_local.models.config import LocalSettings
+                    from ado_local.cache.task_cache import resolve_task
+                    from ado_local.execution.checkout import detect_git_remote, parse_azure_devops_remote
+                    settings_ = _load_settings()
+                    cache_dir = Path(settings_.task_cache_dir)
+                    all_found = True
+                    for spec in task_specs:
+                        msg = f"[dim]  {spec}...[/]"
+                        self._preflight_logs.append(f"  {spec}...")
+                        self._write_log(msg)
+                        result = resolve_task(
+                            spec, cache_dir, auto_download=True,
+                            log_callback=lambda m: self._preflight_logs.append(
+                                m.removeprefix("  ") if m.startswith("  ") else m
+                            ) or self._write_log(f"[dim]{m}[/]"),
                         )
-                        return
+                        if result is None:
+                            if not settings_.azure_devops_token or not settings_.azure_devops_org:
+                                self._prompt_for_pat(settings_)
+                            ado_retries = 0
+                            while ado_retries < 2 and settings_.azure_devops_token and settings_.azure_devops_org:
+                                self._preflight_logs.append(f"  Retrying via Azure DevOps...")
+                                self._write_log("[dim]  Retrying via Azure DevOps...[/]")
+                                result = resolve_task(
+                                    spec, cache_dir, auto_download=False,
+                                    azure_devops_token=settings_.azure_devops_token,
+                                    azure_devops_org=settings_.azure_devops_org,
+                                    azure_devops_project=settings_.azure_devops_project,
+                                    log_callback=lambda m: self._preflight_logs.append(
+                                        m.removeprefix("  ") if m.startswith("  ") else m
+                                    ) or self._write_log(f"[dim]{m}[/]"),
+                                )
+                                if result is not None:
+                                    break
+                                ado_retries += 1
+                                if ado_retries < 2:
+                                    self._preflight_logs.append(f"  ADO download failed — you may need to update your PAT")
+                                    self._write_log("[yellow]  ADO download failed — you may need to update your PAT[/]")
+                                    self._prompt_for_pat(settings_)
+                        if result is None:
+                            self._preflight_logs.append(f"  {spec} NOT FOUND")
+                            self._write_log(f"[yellow]  {spec} NOT FOUND (will fail)[/]")
+                            all_found = False
+                        else:
+                            line = f"  {spec} -> {result.name} {result.resolved_version}"
+                            self._preflight_logs.append(line)
+                            self._write_log(f"[green]{line}[/]")
+                    self.app.call_from_thread(self._finish_preflight, not all_found)
+                    if not all_found:
+                        self._preflight_continue_event = threading.Event()
+                        self._preflight_continue_value = False
+                        self.app.call_from_thread(self._show_retry_dialog)
+                        self._preflight_continue_event.wait()
+                        if not self._preflight_continue_value:
+                            cancelled_pipeline = Pipeline(name=self._pipeline_info["name"])
+                            cancelled_pipeline.jobs = [Job(name="default")]
+                            self.app.call_from_thread(
+                                self.app.push_screen, RunResultScreen(cancelled_pipeline, 0.0, self._preflight_logs)
+                            )
+                            return
+                else:
+                    self.app.call_from_thread(self._finish_preflight, False)
             else:
                 self.app.call_from_thread(self._finish_preflight, False)
 
@@ -1477,7 +1868,9 @@ class RunScreen(Screen):
             else:
                 pipe_vars = {}
 
-            if not self._prompt_runtime_variables(pipe_vars):
+            if self._resume_pipeline:
+                pipe_vars = dict(self._resume_pipeline.variables)
+            elif not self._prompt_runtime_variables(pipe_vars):
                 cancelled_pipeline = Pipeline(name=self._pipeline_info["name"])
                 cancelled_pipeline.jobs = [Job(name="default")]
                 self.app.call_from_thread(
@@ -1485,10 +1878,10 @@ class RunScreen(Screen):
                 )
                 return
 
-            pipeline = Pipeline(name=self._pipeline_info["name"], variables=pipe_vars)
+            pipeline = Pipeline(name=self._pipeline_info["name"], variables=pipe_vars, parameters=params)
             job = Job(name="default")
 
-            for step_data in steps_raw:
+            for step_idx, step_data in enumerate(steps_raw):
                 if "task" in step_data:
                     step = TaskStep(
                         task=step_data["task"],
@@ -1540,18 +1933,28 @@ class RunScreen(Screen):
                     )
                 else:
                     continue
+                if self._resume_step_index is not None and step_idx < self._resume_step_index:
+                    step = self._copy_previous_step_state(step_idx, step)
                 job.steps.append(step)
 
             pipeline.jobs = [job]
             self._pipeline = pipeline
 
             settings = _load_settings()
+            if self._resume_step_index is not None and self._resume_workspace_path:
+                from ado_local.execution.workspace import WorkspaceManager
+                ws = WorkspaceManager.from_existing(settings, self._resume_workspace_path)
+            else:
+                ws = None
             self._engine = PipelineEngine(
                 settings,
                 event_handler=self._handle_pipeline_event,
                 cancel_requested=self._cancel_requested,
             )
-            self._engine.execute(pipeline)
+            self._engine.execute(pipeline,
+                                 params=params,
+                                 start_from_step=self._resume_step_index or 0,
+                                 workspace=ws)
 
         except Exception as e:
             import traceback
@@ -1572,8 +1975,9 @@ class ConfirmQuitDialog(ModalScreen[bool]):
         yield Container(
             Label("A pipeline is still running.\nQuit anyway?"),
             Horizontal(
-                Button("Yes", variant="error", id="yes"),
-                Button("No", variant="primary", id="no"),
+                Static(" Yes ", id="yes", classes="raw-log-action danger-action"),
+                Static(" No ", id="no", classes="raw-log-action"),
+                id="confirm-buttons",
             ),
             id="confirm-container",
         )
@@ -1586,6 +1990,12 @@ class ConfirmQuitDialog(ModalScreen[bool]):
 
     def action_cancel(self) -> None:
         self.dismiss(False)
+
+    def on_click(self, event: events.Click) -> None:
+        if getattr(event.widget, "id", None) == "yes":
+            self.dismiss(True)
+        elif getattr(event.widget, "id", None) == "no":
+            self.dismiss(False)
 
 
 class AdoLocalApp(App):
@@ -1630,8 +2040,28 @@ class AdoLocalApp(App):
         margin: 0 0 1 0;
     }
     #buttons {
-        height: 3;
+        height: 1;
         align: center middle;
+    }
+    #analyze {
+        width: 11;
+        min-width: 11;
+        margin: 0 1;
+    }
+    #run {
+        width: 8;
+        min-width: 8;
+        margin: 0 1;
+    }
+    #refresh {
+        width: 11;
+        min-width: 11;
+        margin: 0 1;
+    }
+    #quit {
+        width: 9;
+        min-width: 9;
+        margin: 0 1;
     }
     Button {
         margin: 0 1;
@@ -1651,12 +2081,12 @@ class AdoLocalApp(App):
         height: 1fr;
     }
     #steps-panel {
-        width: 34%;
+        width: 54;
         border: solid #333;
         padding: 0 1;
     }
     #logs-panel {
-        width: 66%;
+        width: 1fr;
         border: solid #333;
         padding: 0 1;
     }
@@ -1694,6 +2124,7 @@ class AdoLocalApp(App):
         text-style: bold;
         content-align: center middle;
         height: 1;
+        min-height: 1;
     }
     .raw-log-action:hover {
         background: #0078d4;
@@ -1743,8 +2174,62 @@ class AdoLocalApp(App):
         margin: 0 0 1 0;
     }
     #param-buttons {
-        height: 3;
+        height: 1;
         align: center middle;
+    }
+    #run-params {
+        width: 8;
+        min-width: 8;
+        margin: 0 1;
+    }
+    #runtime-vars-buttons {
+        height: 1;
+        align: center middle;
+    }
+    #runtime-vars-run {
+        width: 12;
+        min-width: 12;
+        margin: 0 1;
+    }
+    #runtime-vars-cancel {
+        width: 10;
+        min-width: 10;
+        margin: 0 1;
+    }
+    #pat-buttons, #retry-buttons, #confirm-buttons {
+        height: 1;
+        align: center middle;
+        margin: 1 0 0 0;
+    }
+    #save-btn {
+        width: 19;
+        min-width: 19;
+        margin: 0 1;
+    }
+    #skip-btn {
+        width: 9;
+        min-width: 9;
+        margin: 0 1;
+    }
+    #continue-btn {
+        width: 12;
+        min-width: 12;
+        margin: 0 1;
+    }
+    #cancel-btn {
+        width: 10;
+        min-width: 10;
+        margin: 0 1;
+    }
+    #yes {
+        width: 8;
+        min-width: 8;
+        margin: 0 1;
+    }
+    #no {
+        width: 7;
+        min-width: 7;
+        margin: 0 1;
     }
     #runtime-vars-dialog {
         width: 70%;
@@ -1779,16 +2264,31 @@ class AdoLocalApp(App):
         height: 1;
         margin: 0 0 1 0;
     }
+    #result-artifacts {
+        height: 1;
+        margin: 0 0 1 0;
+    }
+    .artifact-link {
+        background: #2d2d2d;
+        color: #ffffff;
+        text-style: bold;
+        content-align: center middle;
+        height: 1;
+        margin: 0 1 0 0;
+    }
+    .artifact-link:hover {
+        background: #0078d4;
+    }
     #result-panels {
         height: 1fr;
     }
     #result-steps-panel {
-        width: 34%;
+        width: 54;
         border: solid #333;
         padding: 0 1;
     }
     #result-logs-panel {
-        width: 66%;
+        width: 1fr;
         border: solid #333;
         padding: 0 1;
     }
@@ -1819,6 +2319,17 @@ class AdoLocalApp(App):
         height: 1;
         min-height: 1;
         margin: 0 1;
+    }
+    #restart-step {
+        width: 18;
+        min-width: 18;
+        height: 1;
+        min-height: 1;
+        margin: 0 1;
+    }
+    #result-footer {
+        height: 1;
+        align: center middle;
     }
     #result-step-detail {
         height: 1;
@@ -1851,6 +2362,17 @@ class AdoLocalApp(App):
         min-width: 12;
         height: 1;
         min-height: 1;
+        margin: 0 1 0 0;
+    }
+    #open-artifact {
+        width: 17;
+        min-width: 17;
+        height: 1;
+        min-height: 1;
+        margin: 0 0 0 0;
+    }
+    #history-actions {
+        height: 1;
         margin: 0 0 1 0;
     }
     #back {
@@ -1892,4 +2414,5 @@ class AdoLocalApp(App):
             self.exit()
 
     def on_mount(self) -> None:
+        _cleanup_orphan_workspaces_async()
         self.push_screen(PipelineSelectScreen())

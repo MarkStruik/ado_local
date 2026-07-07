@@ -13,6 +13,7 @@ from ado_local.models.pipeline import TaskStep, StepStatus
 from ado_local.logging.command_parser import LoggingCommandProcessor
 from ado_local.logging.ansi import normalize_log_line
 from ado_local.models.events import EventType, PipelineEvent, EventHandler
+from ado_local.parser.variable_expander import expand_variables
 
 
 def execute_task(
@@ -40,7 +41,8 @@ def execute_task(
 
     handler = handlers[0]
     task_path = Path(task.path)
-    target_script = task_path / handler.target
+    target = handler.target.replace("$(currentDirectory)", str(task_path))
+    target_script = task_path / target
 
     if not target_script.exists():
         step.status = StepStatus.FAILED
@@ -53,9 +55,11 @@ def execute_task(
         service_connections, azure_devops_token, azure_devops_org, azure_devops_project,
     )
     cmd = _build_command(handler, target_script)
+    task_cwd_raw = handler.working_directory or workspace_env.get("BUILD_SOURCESDIRECTORY") or str(task_path)
+    task_cwd = Path(str(expand_variables(task_cwd_raw, variables))).resolve()
 
-    step.logs.append(f"Running: {' '.join(cmd)}")
-    _emit(event_handler, EventType.STEP_LOG, step_index=step_index, step_name=step.task, log_line=f"Running: {' '.join(cmd)}")
+    step.logs.append(f"Running: {' '.join(cmd)} in {task_cwd}")
+    _emit(event_handler, EventType.STEP_LOG, step_index=step_index, step_name=step.task, log_line=f"Running: {' '.join(cmd)} in {task_cwd}")
 
     command_processor = LoggingCommandProcessor()
 
@@ -68,7 +72,7 @@ def execute_task(
             text=True,
             encoding="utf-8",
             errors="replace",
-            cwd=str(task_path),
+            cwd=str(task_cwd),
         )
 
         for line in iter(proc.stdout.readline, ""):
@@ -137,6 +141,38 @@ def _build_command(handler: TaskExecution, target: Path) -> list[str]:
     if handler.handler_type in (HandlerType.NODE, HandlerType.NODE10, HandlerType.NODE16, HandlerType.NODE20, HandlerType.NODE20_1):
         return ["node", str(target_abs)]
     elif handler.handler_type in (HandlerType.POWER_SHELL, HandlerType.POWER_SHELL2, HandlerType.POWER_SHELL3):
+        sdk_dir = target_abs.parent / "ps_modules" / "VstsTaskSdk"
+        if sdk_dir.is_dir():
+            import uuid
+            shim = (
+                "function Get-VstsInput {\n"
+                "  param([string]$Name,[switch]$Require,[string]$Default,[switch]$AsBool,[switch]$AsInt)\n"
+                "  $k='INPUT_'+$Name.Replace(' ','_').ToUpperInvariant()\n"
+                "  $envs=[Environment]::GetEnvironmentVariables()\n"
+                "  $exists=$envs.Contains($k)\n"
+                "  $v=[Environment]::GetEnvironmentVariable($k)\n"
+                "  if(!$exists -and $Require){throw \"Input '$Name' required\"}\n"
+                "  if(!$exists){$v=$Default}\n"
+                "  if($AsBool){return $v -in '1','true'}\n"
+                "  if($AsInt){return try{[int]$v}catch{0}}\n"
+                "  $v\n"
+                "}\n"
+                "function Invoke-VstsTool{\n"
+                "  param([string]$FileName,[string]$Arguments,[switch]$RequireExitCodeZero)\n"
+                "  Write-Host \"##[command]$FileName $Arguments\"\n"
+                "  $ef=$FileName-replace\"'\",\"''\"\n"
+                "  iex \"& '$ef' $Arguments\"\n"
+                "  if($RequireExitCodeZero -and $global:LASTEXITCODE -ne 0){\n"
+                "    throw \"Exit code $global:LASTEXITCODE\"\n"
+                "  }\n"
+                "}\n"
+                f". '{target_abs.as_posix()}'"
+            )
+            shim_dir = Path(os.environ.get("TEMP", os.environ.get("TMP", "/tmp"))) / ".ado-local"
+            shim_dir.mkdir(parents=True, exist_ok=True)
+            shim_path = shim_dir / f"shim_{uuid.uuid4().hex[:8]}.ps1"
+            shim_path.write_text(shim, encoding="utf-8")
+            return ["pwsh", "-NoProfile", "-File", str(shim_path)]
         return ["pwsh", "-File", str(target_abs)]
     elif handler.handler_type == HandlerType.PROCESS:
         return [str(target_abs)]

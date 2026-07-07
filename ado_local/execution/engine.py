@@ -44,26 +44,32 @@ class PipelineEngine:
         self.params: dict[str, Any] = {}
         self.counters: dict[str, int] = {}
 
-    def execute(self, pipeline: Pipeline, params: dict[str, Any] | None = None) -> Pipeline:
+    def execute(self, pipeline: Pipeline, params: dict[str, Any] | None = None,
+                start_from_step: int = 0,
+                workspace: WorkspaceManager | None = None) -> Pipeline:
         self.params = params or {}
         self.variables = dict(pipeline.variables)
         self.variables.update(self.settings.variables)
         self.variables["parameters"] = {**pipeline.parameters, **self.params}
         self._evaluate_runtime_variables()
 
-        self.workspace = WorkspaceManager(self.settings)
-        work_dir = self.workspace.create()
-        self.variables["System.DefaultWorkingDirectory"] = str(work_dir.resolve())
-        pipeline.workspace_dir = str(work_dir.resolve())
+        if workspace:
+            self.workspace = workspace
+        else:
+            self.workspace = WorkspaceManager(self.settings)
+            self.workspace.create()
+        work_dir = self.workspace.root.resolve()
+        self.variables["System.DefaultWorkingDirectory"] = str(work_dir)
+        pipeline.workspace_dir = str(work_dir)
 
         self._emit(EventType.PIPELINE_START)
 
         if pipeline.stages:
-            self._execute_stages(pipeline)
+            self._execute_stages(pipeline, start_from_step=start_from_step)
         elif pipeline.jobs:
-            self._execute_jobs(pipeline)
+            self._execute_jobs(pipeline, start_from_step=start_from_step)
         elif pipeline.steps:
-            self._execute_steps(pipeline, self.variables)
+            self._execute_steps(pipeline, self.variables, start_from_step=start_from_step)
 
         self._emit(EventType.PIPELINE_COMPLETE, status="completed")
         return pipeline
@@ -75,32 +81,37 @@ class PipelineEngine:
                 self.variables[key] = eval_runtime_expression(value, context, self.counters)
                 context["variables"] = self.variables
 
-    def _execute_stages(self, pipeline: Pipeline) -> None:
+    def _execute_stages(self, pipeline: Pipeline, start_from_step: int = 0) -> None:
         for stage in pipeline.stages:
             self._emit(EventType.STAGE_START, step_name=stage.name)
             stage.status = JobStatus.RUNNING
             for job in stage.jobs:
-                self._execute_job(job, stage.variables)
+                self._execute_job(job, stage.variables, start_from_step=start_from_step)
             stage.status = JobStatus.SUCCEEDED
             self._emit(EventType.STAGE_COMPLETE, step_name=stage.name)
 
-    def _execute_jobs(self, pipeline: Pipeline) -> None:
+    def _execute_jobs(self, pipeline: Pipeline, start_from_step: int = 0) -> None:
         for job in pipeline.jobs:
             self._emit(EventType.JOB_START, step_name=job.name)
             job.status = JobStatus.RUNNING
-            self._execute_job(job, pipeline.variables)
+            self._execute_job(job, pipeline.variables, start_from_step=start_from_step)
             job.status = JobStatus.SUCCEEDED
             self._emit(EventType.JOB_COMPLETE, step_name=job.name)
 
-    def _execute_job(self, job: Job, inherited_vars: dict[str, Any]) -> None:
+    def _execute_job(self, job: Job, inherited_vars: dict[str, Any], start_from_step: int = 0) -> None:
         job.start_time = time.time()
         merged_vars = {**inherited_vars, **job.variables, **self.variables}
-        self._execute_steps_in_job(job, merged_vars)
+        self._execute_steps_in_job(job, merged_vars, start_from_step=start_from_step)
         job.end_time = time.time()
 
-    def _execute_steps_in_job(self, job: Job, variables: dict[str, Any]) -> None:
+    def _execute_steps_in_job(self, job: Job, variables: dict[str, Any], start_from_step: int = 0) -> None:
         failed = False
         for step_idx, step in enumerate(job.steps):
+            if step_idx < start_from_step:
+                # Resume keeps previous step state/logs from history; do not mark
+                # already-run steps as skipped or let prior failures block retry.
+                continue
+
             if not step.enabled:
                 step.status = StepStatus.SKIPPED
                 self._emit(EventType.STEP_START, step_index=step_idx, step_name=str(step))
@@ -271,18 +282,24 @@ class PipelineEngine:
         step.status = StepStatus.RUNNING
         step.start_time = time.time()
 
-        source = expand_variables(step.publish, variables)
+        source_raw = expand_variables(step.publish, variables)
+        source_path = Path(source_raw)
+        if not source_path.is_absolute() and self.workspace:
+            source_path = self.workspace.sources_dir / source_path
+        source = str(source_path)
         name = expand_variables(step.artifact, variables)
         step.logs.append(f"Publishing '{name}' from {source}")
         self._emit(EventType.STEP_LOG, step_index=step_idx, step_name=str(step), log_line=f"Publishing '{name}' from {source}")
 
         try:
-            publisher = ArtifactPublisher(self.settings)
+            artifact_root = self.workspace.staging_dir.resolve() if self.workspace else Path(self.settings.artifact_root)
+            pub_settings = self.settings.model_copy(update={"artifact_root": str(artifact_root)})
+            publisher = ArtifactPublisher(pub_settings)
             dest = publisher.publish(source, name)
             step.artifact_path = str(dest.resolve())
             step.status = StepStatus.SUCCEEDED
-            step.logs.append(f"Published to {dest}")
-            self._emit(EventType.STEP_LOG, step_index=step_idx, step_name=str(step), log_line=f"Published to {dest}")
+            step.logs.append(f"Published artifact: {dest}")
+            self._emit(EventType.STEP_LOG, step_index=step_idx, step_name=str(step), log_line=f"Published artifact: {dest}")
         except Exception as e:
             step.status = StepStatus.FAILED
             step.logs.append(f"Publish failed: {e}")
